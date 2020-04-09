@@ -24,7 +24,7 @@ use crate::result::CodegenResult;
 use crate::stack_layout::layout_stack;
 use alloc::borrow::Cow;
 use core::i32;
-use std::boxed::Box;
+use alloc::boxed::Box;
 use target_lexicon::{PointerWidth, Triple};
 
 /// Argument registers for x86-64

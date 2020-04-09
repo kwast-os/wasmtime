@@ -1,5 +1,8 @@
 //! This library contains code that is common to both the `cranelift-codegen` and
 //! `cranelift-codegen-meta` libraries.
+//!
+
+#![no_std]
 
 #![deny(missing_docs, trivial_numeric_casts, unused_extern_crates)]
 #![warn(unused_import_braces)]
@@ -19,6 +22,9 @@
         clippy::use_self
     )
 )]
+
+#[macro_use]
+extern crate alloc;
 
 pub mod condcodes;
 pub mod constant_hash;

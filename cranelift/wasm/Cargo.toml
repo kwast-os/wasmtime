@@ -19,7 +19,7 @@ cranelift-frontend = { path = "../frontend", version = "0.62.0", default-feature
 hashbrown = { version = "0.7", optional = true }
 log = { version = "0.4.6", default-features = false }
 serde = { version = "1.0.94", features = ["derive"], optional = true }
-thiserror = "1.0.4"
+thiserror = { git = "https://github.com/kwast-os/thiserror" }
 
 [dev-dependencies]
 wat = "1.0.9"

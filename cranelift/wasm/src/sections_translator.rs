@@ -144,7 +144,7 @@ pub fn parse_function_section(
     environ: &mut dyn ModuleEnvironment,
 ) -> WasmResult<()> {
     let num_functions = functions.get_count();
-    if num_functions == std::u32::MAX {
+    if num_functions == core::u32::MAX {
         // We reserve `u32::MAX` for our own use in cranelift-entity.
         return Err(WasmError::ImplLimitExceeded);
     }
@@ -447,7 +447,7 @@ fn parse_function_name_subsection(
     let mut function_names = HashMap::new();
     for _ in 0..naming_reader.get_count() {
         let Naming { index, name } = naming_reader.read().ok()?;
-        if index == std::u32::MAX {
+        if index == core::u32::MAX {
             // We reserve `u32::MAX` for our own use in cranelift-entity.
             return None;
         }

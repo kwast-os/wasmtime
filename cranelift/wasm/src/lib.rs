@@ -29,12 +29,12 @@
 )]
 #![no_std]
 
-#[cfg(not(feature = "std"))]
+//#[cfg(not(feature = "std"))]
 #[macro_use]
 extern crate alloc as std;
-#[cfg(feature = "std")]
-#[macro_use]
-extern crate std;
+//#[cfg(feature = "std")]
+//#[macro_use]
+//extern crate std;
 
 #[cfg(not(feature = "std"))]
 use hashbrown::{

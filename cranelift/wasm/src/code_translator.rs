@@ -40,8 +40,8 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::packed_option::ReservedValue;
 use cranelift_frontend::{FunctionBuilder, Variable};
-use std::cmp;
-use std::convert::TryFrom;
+use core::cmp;
+use core::convert::TryFrom;
 use std::vec::Vec;
 use wasmparser::{MemoryImmediate, Operator};
 
@@ -1051,9 +1051,9 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             let index = FuncIndex::from_u32(*function_index);
             state.push1(environ.translate_ref_func(builder.cursor(), index)?);
         }
-        Operator::AtomicNotify { .. }
-        | Operator::I32AtomicWait { .. }
-        | Operator::I64AtomicWait { .. }
+        Operator::MemoryAtomicNotify { .. }
+        | Operator::MemoryAtomicWait32 { .. }
+        | Operator::MemoryAtomicWait64 { .. }
         | Operator::I32AtomicLoad { .. }
         | Operator::I64AtomicLoad { .. }
         | Operator::I32AtomicLoad8U { .. }

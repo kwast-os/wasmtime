@@ -146,7 +146,7 @@ use crate::machinst::{BlockIndex, MachInstLabelUse, VCodeInst};
 
 use log::trace;
 use smallvec::SmallVec;
-use std::mem;
+use core::mem;
 
 /// A buffer of output to be produced, fixed up, and then emitted to a CodeSink
 /// in bulk.

@@ -604,7 +604,7 @@ dependencies = [
  "serde",
  "target-lexicon",
  "thiserror 1.0.20 (git+https://github.com/kwast-os/thiserror)",
- "wasmparser 0.59.0",
+ "wasmparser 0.61.0",
  "wat",
 ]
 
@@ -1710,7 +1710,7 @@ dependencies = [
 [[package]]
 name = "regalloc"
 version = "0.0.28"
-source = "git+https://github.com/kwast-os/regalloc.rs?branch=0.0.27#bc6850acc77a87beda0378cf5b019f05f9400839"
+source = "git+https://github.com/kwast-os/regalloc.rs?branch=0.0.27#bd0f064bc70b9aa0c261cfaafd7cf65343219e81"
 dependencies = [
  "hashbrown 0.7.2",
  "log",

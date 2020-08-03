@@ -10,9 +10,9 @@ use crate::ir::instructions::BranchInfo;
 use crate::ir::Function;
 use crate::ir::{Block, Inst, Value};
 use crate::timing;
+use alloc::vec::Vec;
 
 use smallvec::{smallvec, SmallVec};
-use std::vec::Vec;
 
 // A note on notation.  For the sake of clarity, this file uses the phrase
 // "formal parameters" to mean the `Value`s listed in the block head, and

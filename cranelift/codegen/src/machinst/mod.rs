@@ -110,7 +110,7 @@ use regalloc::{
     RealReg, RealRegUniverse, Reg, RegClass, RegUsageMapper, SpillSlot, VirtualReg, Writable,
 };
 use smallvec::SmallVec;
-use std::string::String;
+use alloc::string::String;
 use target_lexicon::Triple;
 
 pub mod lower;

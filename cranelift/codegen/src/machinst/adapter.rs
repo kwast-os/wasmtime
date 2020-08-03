@@ -11,8 +11,8 @@ use crate::settings::Flags;
 use crate::regalloc::RegDiversions;
 
 use core::any::Any;
-use std::borrow::Cow;
-use std::fmt;
+use alloc::borrow::Cow;
+use core::fmt;
 use target_lexicon::Triple;
 
 /// A wrapper around a `MachBackend` that provides a `TargetIsa` impl.

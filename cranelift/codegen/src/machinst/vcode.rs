@@ -30,9 +30,9 @@ use regalloc::{
 
 use alloc::boxed::Box;
 use alloc::{borrow::Cow, vec::Vec};
-use std::fmt;
-use std::iter;
-use std::string::String;
+use core::fmt;
+use core::iter;
+use alloc::string::String;
 
 /// Index referring to an instruction in VCode.
 pub type InsnIndex = u32;
@@ -624,7 +624,7 @@ impl<I: VCodeInst> fmt::Debug for VCode<I> {
 /// Pretty-printing with `RealRegUniverse` context.
 impl<I: VCodeInst> ShowWithRRU for VCode<I> {
     fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
-        use std::fmt::Write;
+        use core::fmt::Write;
 
         let mut s = String::new();
         write!(&mut s, "VCode_ShowWithRRU {{{{\n").unwrap();

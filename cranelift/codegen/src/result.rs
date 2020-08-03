@@ -1,7 +1,7 @@
 //! Result and error types representing the outcome of compiling a function.
 
 use crate::verifier::VerifierErrors;
-use std::string::String;
+use alloc::string::String;
 use thiserror::Error;
 
 /// A compilation error.

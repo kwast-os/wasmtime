@@ -2,9 +2,9 @@
 
 use regalloc::{RealRegUniverse, Reg, Writable};
 
-use std::fmt::Debug;
-use std::hash::Hash;
-use std::string::{String, ToString};
+use core::fmt::Debug;
+use core::hash::Hash;
+use alloc::string::{String, ToString};
 
 // FIXME: Should this go into regalloc.rs instead?
 

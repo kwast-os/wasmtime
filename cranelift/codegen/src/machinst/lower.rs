@@ -370,7 +370,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             }
         }
 
-        let vreg_needed = std::iter::repeat(false).take(next_vreg as usize).collect();
+        let vreg_needed = core::iter::repeat(false).take(next_vreg as usize).collect();
 
         Ok(Lower {
             f,

@@ -11,7 +11,7 @@
 //! for each function we compile.
 
 use alloc::vec::Vec;
-use std::string::String;
+use alloc::string::String;
 
 use regalloc::{RealReg, RealRegUniverse, Reg, RegClass, RegClassInfo, NUM_REG_CLASSES};
 

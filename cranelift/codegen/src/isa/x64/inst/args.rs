@@ -1,7 +1,7 @@
 //! Instruction operand sub-components (aka "parts"): definitions and printing.
 
-use std::fmt;
-use std::string::{String, ToString};
+use core::fmt;
+use alloc::string::{String, ToString};
 
 use regalloc::{RealRegUniverse, Reg, RegClass, RegUsageCollector, RegUsageMapper};
 

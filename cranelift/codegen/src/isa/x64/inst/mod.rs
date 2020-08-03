@@ -6,8 +6,8 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use std::fmt;
-use std::string::{String, ToString};
+use core::fmt;
+use alloc::string::{String, ToString};
 
 use regalloc::RegUsageCollector;
 use regalloc::{RealRegUniverse, Reg, RegClass, RegUsageMapper, SpillSlot, VirtualReg, Writable};

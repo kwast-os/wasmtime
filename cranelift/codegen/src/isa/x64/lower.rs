@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use std::convert::TryFrom;
+use core::convert::TryFrom;
 
 use crate::ir::types;
 use crate::ir::types::*;

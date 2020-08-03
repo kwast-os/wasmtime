@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use log::trace;
 use regalloc::{RealReg, Reg, RegClass, Set, SpillSlot, Writable};
-use std::mem;
+use core::mem;
 
 use crate::binemit::Stackmap;
 use crate::ir::{self, types, types::*, ArgumentExtension, StackSlot, Type};
@@ -848,7 +848,7 @@ fn compute_arg_locs(
             // Compute size. Every arg takes a minimum slot of 8 bytes. (16-byte
             // stack alignment happens separately after all args.)
             let size = (param.value_type.bits() / 8) as u64;
-            let size = std::cmp::max(size, 8);
+            let size = core::cmp::max(size, 8);
             // Align.
             debug_assert!(size.is_power_of_two());
             next_stack = (next_stack + size - 1) & !(size - 1);

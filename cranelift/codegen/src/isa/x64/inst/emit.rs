@@ -1,7 +1,7 @@
 use log::debug;
 use regalloc::Reg;
 
-use std::convert::TryFrom;
+use core::convert::TryFrom;
 
 use crate::binemit::Reloc;
 use crate::isa::x64::inst::*;

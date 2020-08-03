@@ -6,7 +6,7 @@ use gimli::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
-use wasmparser::{self, ModuleReader, SectionCode};
+use wasmparser::{self, NameSectionReader, Parser, Payload, TypeDef};
 
 trait Reader: gimli::Reader<Offset = usize, Endian = LittleEndian> {}
 
@@ -61,47 +61,41 @@ fn convert_sections<'a>(sections: HashMap<&str, &'a [u8]>) -> Result<Dwarf<'a>> 
         sections.get(".debug_line").unwrap_or(&EMPTY_SECTION),
         endian,
     );
+    let debug_addr = DebugAddr::from(EndianSlice::new(
+        sections.get(".debug_addr").unwrap_or(&EMPTY_SECTION),
+        endian,
+    ));
 
-    if sections.contains_key(".debug_addr") {
-        bail!("Unexpected .debug_addr");
-    }
-
-    let debug_addr = DebugAddr::from(EndianSlice::new(EMPTY_SECTION, endian));
-
-    if sections.contains_key(".debug_line_str") {
-        bail!("Unexpected .debug_line_str");
-    }
-
-    let debug_line_str = DebugLineStr::from(EndianSlice::new(EMPTY_SECTION, endian));
+    let debug_line_str = DebugLineStr::from(EndianSlice::new(
+        sections.get(".debug_line_str").unwrap_or(&EMPTY_SECTION),
+        endian,
+    ));
     let debug_str_sup = DebugStr::from(EndianSlice::new(EMPTY_SECTION, endian));
-
-    if sections.contains_key(".debug_rnglists") {
-        bail!("Unexpected .debug_rnglists");
-    }
 
     let debug_ranges = match sections.get(".debug_ranges") {
         Some(section) => DebugRanges::new(section, endian),
         None => DebugRanges::new(EMPTY_SECTION, endian),
     };
-    let debug_rnglists = DebugRngLists::new(EMPTY_SECTION, endian);
+    let debug_rnglists = match sections.get(".debug_rnglists") {
+        Some(section) => DebugRngLists::new(section, endian),
+        None => DebugRngLists::new(EMPTY_SECTION, endian),
+    };
     let ranges = RangeLists::new(debug_ranges, debug_rnglists);
-
-    if sections.contains_key(".debug_loclists") {
-        bail!("Unexpected .debug_loclists");
-    }
 
     let debug_loc = match sections.get(".debug_loc") {
         Some(section) => DebugLoc::new(section, endian),
         None => DebugLoc::new(EMPTY_SECTION, endian),
     };
-    let debug_loclists = DebugLocLists::new(EMPTY_SECTION, endian);
+    let debug_loclists = match sections.get(".debug_loclists") {
+        Some(section) => DebugLocLists::new(section, endian),
+        None => DebugLocLists::new(EMPTY_SECTION, endian),
+    };
     let locations = LocationLists::new(debug_loc, debug_loclists);
 
-    if sections.contains_key(".debug_str_offsets") {
-        bail!("Unexpected .debug_str_offsets");
-    }
-
-    let debug_str_offsets = DebugStrOffsets::from(EndianSlice::new(EMPTY_SECTION, endian));
+    let debug_str_offsets = DebugStrOffsets::from(EndianSlice::new(
+        sections.get(".debug_str_offsets").unwrap_or(&EMPTY_SECTION),
+        endian,
+    ));
 
     if sections.contains_key(".debug_types") {
         bail!("Unexpected .debug_types");
@@ -161,7 +155,6 @@ fn read_name_section(reader: wasmparser::NameSectionReader) -> wasmparser::Resul
 }
 
 pub fn read_debuginfo(data: &[u8]) -> Result<DebugInfoData> {
-    let mut reader = ModuleReader::new(data)?;
     let mut sections = HashMap::new();
     let mut name_section = None;
     let mut code_section_offset = 0;
@@ -171,57 +164,58 @@ pub fn read_debuginfo(data: &[u8]) -> Result<DebugInfoData> {
     let mut func_params_refs: Vec<usize> = Vec::new();
     let mut func_locals: Vec<Box<[(u32, WasmType)]>> = Vec::new();
 
-    while !reader.eof() {
-        let section = reader.read()?;
-        match section.code {
-            SectionCode::Custom { name, .. } => {
+    for payload in Parser::new(0).parse_all(data) {
+        match payload? {
+            Payload::CustomSection {
+                name,
+                data,
+                data_offset,
+            } => {
                 if name.starts_with(".debug_") {
-                    let mut reader = section.get_binary_reader();
-                    let len = reader.bytes_remaining();
-                    sections.insert(name, reader.read_bytes(len)?);
-                }
-                if name == "name" {
-                    if let Ok(reader) = section.get_name_section_reader() {
+                    sections.insert(name, data);
+                } else if name == "name" {
+                    if let Ok(reader) = NameSectionReader::new(data, data_offset) {
                         if let Ok(section) = read_name_section(reader) {
                             name_section = Some(section);
                         }
                     }
                 }
             }
-            SectionCode::Type => {
-                signatures_params = section
-                    .get_type_section_reader()?
+            Payload::TypeSection(s) => {
+                signatures_params = s
                     .into_iter()
-                    .map(|ft| Ok(ft?.params))
+                    .map(|ft| {
+                        if let Ok(TypeDef::Func(ft)) = ft {
+                            Ok(ft.params)
+                        } else {
+                            unimplemented!("module linking not implemented yet")
+                        }
+                    })
                     .collect::<Result<Vec<_>>>()?;
             }
-            SectionCode::Import => {
-                for i in section.get_import_section_reader()? {
+            Payload::ImportSection(s) => {
+                for i in s {
                     if let wasmparser::ImportSectionEntryType::Function(_) = i?.ty {
                         imported_func_count += 1;
                     }
                 }
             }
-            SectionCode::Function => {
-                func_params_refs = section
-                    .get_function_section_reader()?
+            Payload::FunctionSection(s) => {
+                func_params_refs = s
                     .into_iter()
                     .map(|index| Ok(index? as usize))
                     .collect::<Result<Vec<_>>>()?;
             }
-            SectionCode::Code => {
-                code_section_offset = section.range().start as u64;
-                func_locals = section
-                    .get_code_section_reader()?
+            Payload::CodeSectionStart { range, .. } => {
+                code_section_offset = range.start as u64;
+            }
+            Payload::CodeSectionEntry(body) => {
+                let locals = body.get_locals_reader()?;
+                let locals = locals
                     .into_iter()
-                    .map(|body| {
-                        let locals = body?.get_locals_reader()?;
-                        Ok(locals
-                            .into_iter()
-                            .collect::<Result<Vec<_>, _>>()?
-                            .into_boxed_slice())
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_boxed_slice();
+                func_locals.push(locals);
             }
             _ => (),
         }

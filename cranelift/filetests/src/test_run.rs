@@ -2,14 +2,14 @@
 //!
 //! The `run` test command compiles each function on the host machine and executes it
 
-use crate::function_runner::FunctionRunner;
+use crate::function_runner::SingleFunctionCompiler;
 use crate::subtest::{Context, SubTest, SubtestResult};
-use cranelift_codegen;
 use cranelift_codegen::ir;
 use cranelift_reader::parse_run_command;
 use cranelift_reader::TestCommand;
 use log::trace;
 use std::borrow::Cow;
+use target_lexicon::Architecture;
 
 struct TestRun;
 
@@ -32,21 +32,38 @@ impl SubTest for TestRun {
     }
 
     fn needs_isa(&self) -> bool {
-        false
+        true
     }
 
     fn run(&self, func: Cow<ir::Function>, context: &Context) -> SubtestResult<()> {
-        for comment in context.details.comments.iter() {
-            if comment.text.contains("run") {
-                let trimmed_comment = comment.text.trim_start_matches(|c| c == ' ' || c == ';');
-                let command = parse_run_command(trimmed_comment, &func.signature)
-                    .map_err(|e| format!("{}", e))?;
-                trace!("Parsed run command: {}", command);
-                // TODO in following changes we will use the parsed command to alter FunctionRunner's behavior.
+        // If this test requests to run on a completely different
+        // architecture than the host platform then we skip it entirely,
+        // since we won't be able to natively execute machine code.
+        let requested_arch = context.isa.unwrap().triple().architecture;
+        if requested_arch != Architecture::host() {
+            println!(
+                "skipped {}: host can't run {:?} programs",
+                context.file_path, requested_arch
+            );
+            return Ok(());
+        }
 
-                let runner =
-                    FunctionRunner::with_host_isa(func.clone().into_owned(), context.flags.clone());
-                runner.run()?
+        let mut compiler = SingleFunctionCompiler::with_host_isa(context.flags.clone());
+        for comment in context.details.comments.iter() {
+            if let Some(command) =
+                parse_run_command(comment.text, &func.signature).map_err(|e| e.to_string())?
+            {
+                trace!("Parsed run command: {}", command);
+
+                // Note that here we're also explicitly ignoring `context.isa`,
+                // regardless of what's requested. We want to use the native
+                // host ISA no matter what here, so the ISA listed in the file
+                // is only used as a filter to not run into situations like
+                // running x86_64 code on aarch64 platforms.
+                let compiled_fn = compiler
+                    .compile(func.clone().into_owned())
+                    .map_err(|e| format!("{:?}", e))?;
+                command.run(|_, args| Ok(compiled_fn.call(args)))?;
             }
         }
         Ok(())

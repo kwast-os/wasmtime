@@ -22,7 +22,7 @@ pub fn layout_vmcontext(
     let out_len = ofs.size_of_vmctx() as usize;
     let mut out = vec![0; out_len];
 
-    // Assign unique indicies to unique signatures.
+    // Assign unique indices to unique signatures.
     let mut signature_registry = HashMap::new();
     let mut signature_registry_len = signature_registry.len();
     for (index, sig) in module.local.signatures.iter() {
@@ -42,7 +42,7 @@ pub fn layout_vmcontext(
         }
     }
 
-    let num_tables_imports = module.imported_tables.len();
+    let num_tables_imports = module.local.num_imported_tables;
     let mut table_relocs = Vec::with_capacity(module.local.table_plans.len() - num_tables_imports);
     for (index, table) in module.local.table_plans.iter().skip(num_tables_imports) {
         let def_index = module.local.defined_table_index(index).unwrap();
@@ -66,7 +66,7 @@ pub fn layout_vmcontext(
         });
     }
 
-    let num_globals_imports = module.imported_globals.len();
+    let num_globals_imports = module.local.num_imported_globals;
     for (index, global) in module.local.globals.iter().skip(num_globals_imports) {
         let def_index = module.local.defined_global_index(index).unwrap();
         let offset = ofs.vmctx_vmglobal_definition(def_index) as usize;

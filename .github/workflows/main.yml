@@ -1,10 +1,13 @@
 name: CI
 on:
   push:
-    branches: [master]
+    branches: [main]
     tags-ignore: [dev]
   pull_request:
-    branches: [master]
+    branches: [main]
+defaults:
+  run:
+    shell: bash
 
 jobs:
   # Check Code style quickly by running `rustfmt` over all code
@@ -12,7 +15,7 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v2
       with:
         submodules: true
     - uses: ./.github/actions/install-rust
@@ -25,7 +28,7 @@ jobs:
     name: Doc - build the book
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v2
       with:
         submodules: true
     - run: |
@@ -46,19 +49,36 @@ jobs:
   doc_api:
     name: Doc - build the API documentation
     runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -Dintra-doc-link-resolution-failure
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v2
       with:
         submodules: true
     - uses: ./.github/actions/install-rust
       with:
-        toolchain: nightly-2020-04-07
+        toolchain: nightly
     - run: cargo doc --no-deps --all --exclude wasmtime-cli --exclude test-programs --exclude cranelift-codegen-meta
     - run: cargo doc --package cranelift-codegen-meta --document-private-items
     - uses: actions/upload-artifact@v1
       with:
         name: doc-api
         path: target/doc
+
+  doc_capi:
+    name: Doc - build the C API documentation
+    runs-on: ubuntu-latest
+    container: ubuntu:20.04
+    steps:
+    - run: apt-get update && apt-get install -y doxygen git
+    - uses: actions/checkout@v2
+      with:
+        submodules: true
+    - run: cd crates/c-api && doxygen doxygen.conf
+    - uses: actions/upload-artifact@v1
+      with:
+        name: doc-c-api
+        path: crates/c-api/html
 
   # Quick checks of various feature combinations and whether things
   # compile. The goal here isn't to run tests, mostly just serve as a
@@ -67,18 +87,18 @@ jobs:
     name: Check
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v2
       with:
         submodules: true
     - uses: ./.github/actions/install-rust
       with:
-        toolchain: nightly-2020-04-07
+        toolchain: nightly
 
     # Check some feature combinations of the `wasmtime` crate
-    - run: cargo check --manifest-path crates/api/Cargo.toml --no-default-features
-    - run: cargo check --manifest-path crates/api/Cargo.toml --features wat
-    - run: cargo check --manifest-path crates/api/Cargo.toml --features lightbeam
-    - run: cargo check --manifest-path crates/api/Cargo.toml --features jitdump
+    - run: cargo check --manifest-path crates/wasmtime/Cargo.toml --no-default-features
+    - run: cargo check --manifest-path crates/wasmtime/Cargo.toml --features wat
+    - run: cargo check --manifest-path crates/wasmtime/Cargo.toml --features lightbeam
+    - run: cargo check --manifest-path crates/wasmtime/Cargo.toml --features jitdump
 
     # Check some feature combinations of the `wasmtime-c-api` crate
     - run: cargo check --manifest-path crates/c-api/Cargo.toml --no-default-features
@@ -104,66 +124,54 @@ jobs:
     - run: cargo check --target wasm32-unknown-emscripten -p wasi-common
     - run: cargo check --target armv7-unknown-linux-gnueabihf -p wasi-common
 
+    # Check that codegen and wasm crates typecheck on 1.41.0; this is required
+    # for Firefox.
+    - run: rustup install 1.41.0
+    - run: cargo +1.41.0 check -p cranelift-codegen
+    - run: cargo +1.41.0 check -p cranelift-wasm
 
-  # Download our libFuzzer corpus and make sure that we can still handle all the
-  # inputs.
-  fuzz_corpora:
-    name: Fuzz Corpora
+
+  fuzz_targets:
+    name: Fuzz Targets
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v2
       with:
         submodules: true
-    - uses: actions/checkout@v1
-      with:
-        repository: bytecodealliance/wasmtime-libfuzzer-corpus
-        path: ./wasmtime/fuzz/corpus
-        ref: refs/heads/master
     - uses: ./.github/actions/install-rust
       with:
-        toolchain: nightly-2020-04-07
-    - run: cargo install cargo-fuzz --vers "^0.7"
+        toolchain: nightly
+    - run: cargo install cargo-fuzz --vers "^0.8"
     - run: cargo fetch
       working-directory: ./fuzz
-    - run: cargo fuzz build --release --debug-assertions --features binaryen
-    # Our corpora are too large to run in full on every pull request, they just
-    # take too long. Instead, we sample some of them and make sure that running
-    # our fuzzers over the sampled inputs still works OK.
-    - run: |
-        find fuzz/corpus/compile -type f \
-            | shuf \
-            | head -n 3000 \
-            | xargs cargo fuzz run compile --release --debug-assertions --features binaryen
-      env:
-        RUST_BACKTRACE: 1
-    - run: |
-        find fuzz/corpus/instantiate -type f \
-            | shuf \
-            | head -n 2000 \
-            | xargs cargo fuzz run instantiate --release --debug-assertions --features binaryen
-      env:
-        RUST_BACKTRACE: 1
-    - run: |
-        find fuzz/corpus/instantiate_translated -type f \
-            | shuf \
-            | head -n 1000 \
-            | xargs cargo fuzz run instantiate_translated --release --debug-assertions --features binaryen
-      env:
-        RUST_BACKTRACE: 1
-    - run: |
-        find fuzz/corpus/api_calls -type f \
-            | shuf \
-            | head -n 100 \
-            | xargs cargo fuzz run api_calls --release --debug-assertions --features binaryen
-      env:
-        RUST_BACKTRACE: 1
-    - run: |
-        find fuzz/corpus/differential -type f \
-            | shuf \
-            | head -n 100 \
-            | xargs cargo fuzz run differential --release --debug-assertions --features binaryen
-      env:
-        RUST_BACKTRACE: 1
+    - run: cargo fuzz build --dev --features binaryen
+
+  rebuild_peephole_optimizers:
+    name: Rebuild Peephole Optimizers
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        submodules: true
+    - name: Test `peepmatic`
+      run: |
+        cargo test \
+          --package peepmatic \
+          --package peepmatic-automata \
+          --package peepmatic-fuzzing \
+          --package peepmatic-macro \
+          --package peepmatic-runtime \
+          --package peepmatic-test
+    - name: Rebuild Cranelift's peepmatic-based peephole optimizers
+      run: |
+        cd cranelift/
+        cargo build --features 'enable-peepmatic cranelift-codegen/rebuild-peephole-optimizers'
+    - name: Check that peephole optimizers are up to date
+      run: git diff --exit-code
+    - name: Test `cranelift-codegen` with `peepmatic` enabled
+      run: |
+        cd cranelift/
+        cargo test --features 'enable-peepmatic'
 
   # Perform all tests (debug mode) for `wasmtime`. This runs stable/beta/nightly
   # channels of Rust as well as macOS/Linux/Windows.
@@ -182,7 +190,7 @@ jobs:
             rust: beta
           - build: nightly
             os: ubuntu-latest
-            rust: nightly-2020-04-07
+            rust: nightly
           - build: macos
             os: macos-latest
             rust: stable
@@ -190,7 +198,7 @@ jobs:
             os: windows-latest
             rust: stable
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v2
       with:
         submodules: true
     - uses: ./.github/actions/install-rust
@@ -202,15 +210,15 @@ jobs:
       # Note: libclang is pre-installed on the macOS and linux images.
       if: matrix.os == 'windows-latest'
       run: |
-        Invoke-WebRequest https://releases.llvm.org/9.0.0/LLVM-9.0.0-win64.exe -OutFile llvm-installer.exe
-        7z x llvm-installer.exe -oC:\llvm-binary
-        Write-Host ::set-env name=LIBCLANG_PATH::C:\llvm-binary\bin\libclang.dll
-        Write-Host ::add-path::C:\llvm-binary\bin
+        curl https://releases.llvm.org/9.0.0/LLVM-9.0.0-win64.exe -o llvm-installer.exe
+        7z x llvm-installer.exe -oC:/llvm-binary
+        echo ::set-env name=LIBCLANG_PATH::C:/llvm-binary/bin/libclang.dll
+        echo ::add-path::C:/llvm-binary/bin
 
     - name: Query Clang Version
       if: matrix.os == 'windows-latest'
       run: |
-        Get-Command clang.exe
+        where clang.exe
         clang.exe --version
 
     # Install wasm32 targets in order to build various tests throughout the
@@ -223,26 +231,38 @@ jobs:
 
     # Ensure all our examples build and execute
     - run: cargo run -p run-examples
-
-    # Build and test all features except for lightbeam
-    - run: cargo test --features test-programs/test_programs --all --exclude lightbeam -- --nocapture
       env:
         RUST_BACKTRACE: 1
-        RUSTFLAGS: "-D warnings"
+
+    # Build and test all features except for lightbeam
+    - run: |
+        cargo test \
+            --features test-programs/test_programs \
+            --all \
+            --exclude lightbeam \
+            --exclude peepmatic \
+            --exclude peepmatic-automata \
+            --exclude peepmatic-fuzzing \
+            --exclude peepmatic-macro \
+            --exclude peepmatic-runtime \
+            --exclude peepmatic-test
+      env:
+        RUST_BACKTRACE: 1
 
     # Test debug (DWARF) related functionality.
-    - run: cargo test test_debug_dwarf_ -- --ignored --nocapture --test-threads 1
+    - run: |
+        sudo apt-get install -y gdb
+        cargo test test_debug_dwarf -- --ignored --test-threads 1
       if: matrix.os == 'ubuntu-latest'
       env:
         RUST_BACKTRACE: 1
-        RUSTFLAGS: "-D warnings"
 
     # Build and test lightbeam if we're using the nightly toolchain. Note that
     # Lightbeam tests fail right now, but we don't want to block on that.
     - run: cargo build --package lightbeam
-      if: matrix.rust == 'nightly'
-    - run: cargo test --package lightbeam -- --nocapture
-      if: matrix.rust == 'nightly'
+      if: matrix.build == 'nightly'
+    - run: cargo test --package lightbeam
+      if: matrix.build == 'nightly'
       continue-on-error: true
       env:
         RUST_BACKTRACE: 1
@@ -252,7 +272,7 @@ jobs:
     name: Meta deterministic check
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v2
       with:
         submodules: true
     - name: Install Rust
@@ -268,13 +288,69 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+        - build: x86_64-linux
+          os: ubuntu-latest
+          rust: stable
+        - build: x86_64-macos
+          os: macos-latest
+          rust: stable
+        - build: x86_64-windows
+          os: windows-latest
+          rust: stable
+        - build: x86_64-mingw
+          os: windows-latest
+          target: x86_64-pc-windows-gnu
+          rust: beta        # needs rust-lang/rust#69351 to ride to stable
+        - build: aarch64-linux
+          os: ubuntu-latest
+          rust: stable
+          target: aarch64-unknown-linux-gnu
+          gcc_package: gcc-aarch64-linux-gnu
+          gcc: aarch64-linux-gnu-gcc
+          qemu: qemu-aarch64 -L /usr/aarch64-linux-gnu
+          qemu_target: aarch64-linux-user
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v2
       with:
         submodules: true
     - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
     - uses: ./.github/actions/binary-compatible-builds
+      if: matrix.target == ''
+
+    - name: Configure Cargo target
+      run: |
+        echo ::set-env name=CARGO_BUILD_TARGET::${{ matrix.target }}
+        rustup target add ${{ matrix.target }}
+      if: matrix.target != ''
+
+    - name: Install cross-compilation tools
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.gcc_package }}
+
+        # Download and build qemu from source since the most recent release is
+        # way faster at arm emulation than the current version github actions'
+        # ubuntu image uses. Disable as much as we can to get it to build
+        # quickly.
+        curl https://download.qemu.org/qemu-5.0.0.tar.xz | tar xJf -
+        cd qemu-5.0.0
+        ./configure --target-list=${{ matrix.qemu_target }} --prefix=$HOME/qemu --disable-tools --disable-slirp --disable-fdt --disable-capstone --disable-docs
+        make -j$(nproc) install
+
+        # Configure Cargo for cross compilation and tell it how it can run
+        # cross executables
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo ::set-env name=CARGO_TARGET_${upcase}_RUNNER::$HOME/qemu/bin/${{ matrix.qemu }}
+        echo ::set-env name=CARGO_TARGET_${upcase}_LINKER::${{ matrix.gcc }}
+
+        # See comments in the source for why we enable this during QEMU
+        # emulation.
+        echo ::set-env name=WASMTIME_TEST_NO_HOG_MEMORY::1
+      if: matrix.target != '' && matrix.os == 'ubuntu-latest'
 
     # Install wasm32-wasi target in order to build wasi-common's integration
     # tests
@@ -282,13 +358,28 @@ jobs:
 
     # Build `wasmtime` and executables
     - run: $CENTOS cargo build --release --bin wasmtime
-      shell: bash
+
     # Build `libwasmtime.so`
     - run: $CENTOS cargo build --release --manifest-path crates/c-api/Cargo.toml
-      shell: bash
-    # Test what we just built
-    - run: $CENTOS cargo test --features test-programs/test_programs --release --all --exclude lightbeam --exclude wasmtime --exclude wasmtime-c-api --exclude wasmtime-fuzzing
-      shell: bash
+
+    # Test what we just built.
+    #
+    # Ignore some optional dependencies that are used by features that aren't
+    # enabled by default, are tested in other, dedicated CI jobs, and which
+    # would increase build times here.
+    - run: |
+        $CENTOS cargo test \
+            --features test-programs/test_programs \
+            --release \
+            --all \
+            --exclude lightbeam \
+            --exclude peepmatic \
+            --exclude peepmatic-automata \
+            --exclude peepmatic-fuzzing \
+            --exclude peepmatic-macro \
+            --exclude peepmatic-runtime \
+            --exclude peepmatic-test \
+            --exclude wasmtime-fuzz
       env:
         RUST_BACKTRACE: 1
 
@@ -302,23 +393,28 @@ jobs:
     # something that we'll upload from this action.
 
     - run: mkdir dist
-      shell: bash
 
     # Move binaries to dist folder
     - run: cp target/release/wasmtime dist
-      if: matrix.os != 'windows-latest'
+      if: matrix.os != 'windows-latest' && matrix.target == ''
+    - run: cp target/${{ matrix.target }}/release/wasmtime dist
+      if: matrix.os != 'windows-latest' && matrix.target != ''
     - run: cp target/release/wasmtime.exe dist
-      shell: bash
-      if: matrix.os == 'windows-latest'
+      if: matrix.build == 'x86_64-windows'
+    - run: cp target/x86_64-pc-windows-gnu/release/wasmtime.exe dist
+      if: matrix.build == 'x86_64-mingw'
 
     # Move libwasmtime dylib to dist folder
     - run: cp target/release/libwasmtime.{so,a} dist
-      if: matrix.os == 'ubuntu-latest'
+      if: matrix.os == 'ubuntu-latest' && matrix.target == ''
+    - run: cp target/${{ matrix.target }}/release/libwasmtime.{so,a} dist
+      if: matrix.os == 'ubuntu-latest' && matrix.target != ''
     - run: cp target/release/libwasmtime.{dylib,a} dist
       if: matrix.os == 'macos-latest'
     - run: cp target/release/wasmtime.{dll,lib,dll.lib} dist
-      shell: bash
-      if: matrix.os == 'windows-latest'
+      if: matrix.build == 'x86_64-windows'
+    - run: cp target/x86_64-pc-windows-gnu/release/{wasmtime.dll,libwasmtime.a} dist
+      if: matrix.build == 'x86_64-mingw'
 
     # Make a Windows MSI installer if we're on Windows
     - run: |
@@ -326,12 +422,11 @@ jobs:
         "$WIX/bin/candle" -arch x64 -out target/wasmtime.wixobj ci/wasmtime.wxs
         "$WIX/bin/light" -out dist/installer.msi target/wasmtime.wixobj -ext WixUtilExtension
         rm dist/installer.wixpdb
-      shell: bash
-      if: matrix.os == 'windows-latest'
+      if: matrix.build == 'x86_64-windows'
 
     - uses: actions/upload-artifact@v1
       with:
-        name: bins-${{ matrix.os }}
+        name: bins-${{ matrix.build }}
         path: dist
 
   # Consumes all published artifacts from all the previous build steps, creates
@@ -343,7 +438,7 @@ jobs:
     needs: [doc_book, doc_api, build]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v2
       with:
         submodules: true
     - run: rustup update stable && rustup default stable
@@ -359,25 +454,38 @@ jobs:
       uses: actions/download-artifact@v1
       with:
         name: doc-api
-    - name: Download macOS binaries
+    - name: Download C API docs
       uses: actions/download-artifact@v1
       with:
-        name: bins-macos-latest
-    - name: Download Linux binaries
+        name: doc-c-api
+    - name: Download x86_64 macOS binaries
       uses: actions/download-artifact@v1
       with:
-        name: bins-ubuntu-latest
-    - name: Download Windows binaries
+        name: bins-x86_64-macos
+    - name: Download x86_64 Linux binaries
       uses: actions/download-artifact@v1
       with:
-        name: bins-windows-latest
+        name: bins-x86_64-linux
+    - name: Download AArch64 Linux binaries
+      uses: actions/download-artifact@v1
+      with:
+        name: bins-aarch64-linux
+    - name: Download x86_64 Windows binaries
+      uses: actions/download-artifact@v1
+      with:
+        name: bins-x86_64-windows
+    - name: Download x86_64 Windows MinGW binaries
+      uses: actions/download-artifact@v1
+      with:
+        name: bins-x86_64-mingw
 
     - name: Assemble gh-pages
       run: |
         mv doc-book gh-pages
         mv doc-api gh-pages/api
+        mv doc-c-api gh-pages/c-api
 
-    # If this is a push to the master branch push to the `gh-pages` using a
+    # If this is a push to the main branch push to the `gh-pages` using a
     # deploy key. Note that a deploy key is necessary for now because otherwise
     # using the default token for github actions doesn't actually trigger a page
     # rebuild.
@@ -387,7 +495,7 @@ jobs:
         GITHUB_DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
         BUILD_REPOSITORY_ID: ${{ github.repository }}
         BUILD_SOURCEVERSION: ${{ github.sha }}
-      if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     - name: Calculate tag name
       run: |
@@ -402,9 +510,11 @@ jobs:
     # Assemble all the build artifacts into tarballs and zip archives.
     - name: Assemble tarballs
       run: |
-        ./ci/build-tarballs.sh x86_64-linux ubuntu-latest
-        ./ci/build-tarballs.sh x86_64-windows windows-latest .exe
-        ./ci/build-tarballs.sh x86_64-macos macos-latest
+        ./ci/build-tarballs.sh x86_64-linux
+        ./ci/build-tarballs.sh x86_64-windows .exe
+        ./ci/build-tarballs.sh x86_64-mingw .exe
+        ./ci/build-tarballs.sh x86_64-macos
+        ./ci/build-tarballs.sh aarch64-linux
 
     # Upload all assembled tarballs as an artifact of the github action run, so
     # that way even PRs can inspect the output.
@@ -423,12 +533,12 @@ jobs:
         mkdir -p tmp/whl
         find dist/ -name '*.whl' -type f -exec cp '{}' tmp/whl -v \;
 
-    # ... and if this was an actual push (tag or `master`) then we publish a
+    # ... and if this was an actual push (tag or `main`) then we publish a
     # new release. This'll automatically publish a tag release or update `dev`
     # with this `sha`
     - name: Publish Release
       uses: ./.github/actions/github-release
-      if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
       with:
         files: "dist/*"
         name: ${{ steps.tagname.outputs.val }}
@@ -439,7 +549,7 @@ jobs:
       CARGO_AUDIT_VERSION: 0.11.2
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v2
     - uses: actions/cache@v1
       with:
         path: ${{ runner.tool_cache }}/cargo-audit

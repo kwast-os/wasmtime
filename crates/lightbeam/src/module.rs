@@ -10,7 +10,7 @@ use memoffset::offset_of;
 
 use std::{convert::TryInto, mem};
 use thiserror::Error;
-use wasmparser::{FuncType, MemoryType, ModuleReader, SectionCode, Type};
+use wasmparser::{FuncType, MemoryType, Parser, Payload, Type};
 
 pub trait AsValueType {
     const TYPE: Type;
@@ -182,7 +182,7 @@ impl ExecutableModule {
     ) -> Result<T, ExecutionError> {
         let module = &self.module;
 
-        if func_idx as usize >= module.ctx.func_ty_indicies.len() {
+        if func_idx as usize >= module.ctx.func_ty_indices.len() {
             return Err(ExecutionError::FuncIndexOutOfBounds);
         }
 
@@ -249,7 +249,7 @@ impl VmCtx {
 #[derive(Default, Debug)]
 pub struct SimpleContext {
     types: Vec<FuncType>,
-    func_ty_indicies: Vec<u32>,
+    func_ty_indices: Vec<u32>,
 }
 
 pub const WASM_PAGE_SIZE: usize = 65_536;
@@ -300,8 +300,9 @@ impl Signature for CraneliftSignature {
         // TODO: We want to instead add the `VMContext` to the signature used by
         //       cranelift, removing the special-casing from the internals.
         assert_eq!(self.params[0].purpose, ir::ArgumentPurpose::VMContext);
+        // `self.params[1]` should be caller vmctx
         assert_eq!(self.call_conv, isa::CallConv::SystemV);
-        &self.params[1..]
+        &self.params[2..]
     }
 
     fn returns(&self) -> &[Self::Type] {
@@ -332,6 +333,7 @@ pub trait ModuleContext {
     type Signature: Signature;
     type GlobalType: SigType;
 
+    fn vmctx_builtin_function(&self, index: u32) -> u32;
     fn vmctx_vmglobal_definition(&self, index: u32) -> u32;
     fn vmctx_vmglobal_import_from(&self, index: u32) -> u32;
     fn vmctx_vmmemory_import_from(&self, memory_index: u32) -> u32;
@@ -393,7 +395,7 @@ impl ModuleContext for SimpleContext {
     }
 
     fn func_type_index(&self, func_idx: u32) -> u32 {
-        self.func_ty_indicies[func_idx as usize]
+        self.func_ty_indices[func_idx as usize]
     }
 
     fn defined_global_index(&self, _index: u32) -> Option<u32> {
@@ -422,6 +424,10 @@ impl ModuleContext for SimpleContext {
 
     fn defined_table_index(&self, index: u32) -> Option<u32> {
         Some(index)
+    }
+
+    fn vmctx_builtin_function(&self, _index: u32) -> u32 {
+        unimplemented!()
     }
 
     fn vmctx_vmfunction_import_body(&self, _func_index: u32) -> u32 {
@@ -506,150 +512,58 @@ pub fn translate(data: &[u8]) -> Result<ExecutableModule, Error> {
 
 /// Translate from a slice of bytes holding a wasm module.
 pub fn translate_only(data: &[u8]) -> Result<TranslatedModule, Error> {
-    let mut reader = ModuleReader::new(data)?;
     let mut output = TranslatedModule::default();
 
-    reader.skip_custom_sections()?;
-    if reader.eof() {
-        return Ok(output);
-    }
-    let mut section = reader.read()?;
-
-    if let SectionCode::Type = section.code {
-        let types_reader = section.get_type_section_reader()?;
-        output.ctx.types = translate_sections::type_(types_reader)?;
-
-        reader.skip_custom_sections()?;
-        if reader.eof() {
-            return Ok(output);
-        }
-        section = reader.read()?;
-    }
-
-    if let SectionCode::Import = section.code {
-        let imports = section.get_import_section_reader()?;
-        translate_sections::import(imports)?;
-
-        reader.skip_custom_sections()?;
-        if reader.eof() {
-            return Ok(output);
-        }
-        section = reader.read()?;
-    }
-
-    if let SectionCode::Function = section.code {
-        let functions = section.get_function_section_reader()?;
-        output.ctx.func_ty_indicies = translate_sections::function(functions)?;
-
-        reader.skip_custom_sections()?;
-        if reader.eof() {
-            return Ok(output);
-        }
-        section = reader.read()?;
-    }
-
-    if let SectionCode::Table = section.code {
-        let tables = section.get_table_section_reader()?;
-        translate_sections::table(tables)?;
-
-        reader.skip_custom_sections()?;
-        if reader.eof() {
-            return Ok(output);
-        }
-        section = reader.read()?;
-    }
-
-    if let SectionCode::Memory = section.code {
-        let memories = section.get_memory_section_reader()?;
-        let mem = translate_sections::memory(memories)?;
-
-        if mem.len() > 1 {
-            return Err(Error::Input(
-                "Multiple memory sections not yet implemented".to_string(),
-            ));
-        }
-
-        if !mem.is_empty() {
-            let mem = mem[0];
-            if Some(mem.limits.initial) != mem.limits.maximum {
-                return Err(Error::Input(
-                    "Custom memory limits not supported in lightbeam".to_string(),
-                ));
+    for payload in Parser::new(0).parse_all(data) {
+        match payload? {
+            Payload::TypeSection(s) => output.ctx.types = translate_sections::type_(s)?,
+            Payload::ImportSection(s) => translate_sections::import(s)?,
+            Payload::FunctionSection(s) => {
+                output.ctx.func_ty_indices = translate_sections::function(s)?;
             }
-            output.memory = Some(mem);
+            Payload::TableSection(s) => {
+                translate_sections::table(s)?;
+            }
+            Payload::MemorySection(s) => {
+                let mem = translate_sections::memory(s)?;
+
+                if mem.len() > 1 {
+                    return Err(Error::Input(
+                        "Multiple memory sections not yet implemented".to_string(),
+                    ));
+                }
+
+                if !mem.is_empty() {
+                    let mem = mem[0];
+                    if Some(mem.limits.initial) != mem.limits.maximum {
+                        return Err(Error::Input(
+                            "Custom memory limits not supported in lightbeam".to_string(),
+                        ));
+                    }
+                    output.memory = Some(mem);
+                }
+            }
+            Payload::GlobalSection(s) => {
+                translate_sections::global(s)?;
+            }
+            Payload::ExportSection(s) => {
+                translate_sections::export(s)?;
+            }
+            Payload::StartSection { func, .. } => {
+                translate_sections::start(func)?;
+            }
+            Payload::ElementSection(s) => {
+                translate_sections::element(s)?;
+            }
+            Payload::DataSection(s) => {
+                translate_sections::data(s)?;
+            }
+            Payload::CodeSectionStart { .. }
+            | Payload::CustomSection { .. }
+            | Payload::Version { .. } => {}
+
+            other => unimplemented!("can't translate {:?}", other),
         }
-
-        reader.skip_custom_sections()?;
-        if reader.eof() {
-            return Ok(output);
-        }
-        section = reader.read()?;
-    }
-
-    if let SectionCode::Global = section.code {
-        let globals = section.get_global_section_reader()?;
-        translate_sections::global(globals)?;
-
-        reader.skip_custom_sections()?;
-        if reader.eof() {
-            return Ok(output);
-        }
-        section = reader.read()?;
-    }
-
-    if let SectionCode::Export = section.code {
-        let exports = section.get_export_section_reader()?;
-        translate_sections::export(exports)?;
-
-        reader.skip_custom_sections()?;
-        if reader.eof() {
-            return Ok(output);
-        }
-        section = reader.read()?;
-    }
-
-    if let SectionCode::Start = section.code {
-        let start = section.get_start_section_content()?;
-        translate_sections::start(start)?;
-
-        reader.skip_custom_sections()?;
-        if reader.eof() {
-            return Ok(output);
-        }
-        section = reader.read()?;
-    }
-
-    if let SectionCode::Element = section.code {
-        let elements = section.get_element_section_reader()?;
-        translate_sections::element(elements)?;
-
-        reader.skip_custom_sections()?;
-        if reader.eof() {
-            return Ok(output);
-        }
-        section = reader.read()?;
-    }
-
-    if let SectionCode::Code = section.code {
-        let code = section.get_code_section_reader()?;
-        output.translated_code_section = Some(translate_sections::code(code, &output.ctx)?);
-
-        reader.skip_custom_sections()?;
-        if reader.eof() {
-            return Ok(output);
-        }
-        section = reader.read()?;
-    }
-
-    if let SectionCode::Data = section.code {
-        let data = section.get_data_section_reader()?;
-        translate_sections::data(data)?;
-    }
-
-    if !reader.eof() {
-        return Err(Error::Input(
-            "Unexpected data found after the end of the module".to_string(),
-        ));
     }
 
     Ok(output)

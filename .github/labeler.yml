@@ -19,6 +19,19 @@
 
 "cranelift":
   - "cranelift/**"
+  
+"cranelift:area:machinst":
+  - "cranelift/codegen/src/machinst/**"
+
+"cranelift:area:aarch64":
+  - "cranelift/codegen/src/isa/aarch64/**"
+
+"cranelift:area:x64":
+  - "cranelift/codegen/src/isa/x64/**"
+
+"cranelift:area:peepmatic":
+  - "cranelift/peepmatic/**"
+  - "cranelift/codegen/src/peepmatic.rs"
 
 "cranelift:docs":
   - "cranelift/docs/**"
@@ -49,7 +62,7 @@
   - "crates/wiggle/**"
 
 "wasmtime:api":
-  - "crates/api/**"
+  - "crates/wasmtime/**"
 
 "wasmtime:c-api":
   - "crates/c-api/**"

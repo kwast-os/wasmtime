@@ -1,4 +1,4 @@
-//! This is an example of working with mulit-value modules and dealing with
+//! This is an example of working with multi-value modules and dealing with
 //! multi-value functions.
 //!
 //! Note that the `Func::wrap*` interfaces cannot be used to return multiple
@@ -11,15 +11,13 @@ use anyhow::{format_err, Result};
 use wasmtime::*;
 
 fn main() -> Result<()> {
-    // Configure our `Store`, but be sure to use a `Config` that enables the
-    // wasm multi-value feature since it's not stable yet.
     println!("Initializing...");
-    let engine = Engine::new(Config::new().wasm_multi_value(true));
+    let engine = Engine::default();
     let store = Store::new(&engine);
 
     // Compile.
     println!("Compiling module...");
-    let module = Module::from_file(&store, "examples/multi.wat")?;
+    let module = Module::from_file(&engine, "examples/multi.wat")?;
 
     // Create external print functions.
     println!("Creating callback...");
@@ -38,13 +36,12 @@ fn main() -> Result<()> {
 
     // Instantiate.
     println!("Instantiating module...");
-    let instance = Instance::new(&module, &[callback_func.into()])?;
+    let instance = Instance::new(&store, &module, &[callback_func.into()])?;
 
     // Extract exports.
     println!("Extracting export...");
     let g = instance
-        .get_export("g")
-        .and_then(|e| e.func())
+        .get_func("g")
         .ok_or(format_err!("failed to find export `g`"))?;
 
     // Call `$g`.
@@ -60,8 +57,7 @@ fn main() -> Result<()> {
     // Call `$round_trip_many`.
     println!("Calling export \"round_trip_many\"...");
     let round_trip_many = instance
-        .get_export("round_trip_many")
-        .and_then(|e| e.func())
+        .get_func("round_trip_many")
         .ok_or(format_err!("failed to find export `round_trip_many`"))?;
     let args = vec![
         Val::I64(0),

@@ -2,37 +2,21 @@ test run
 set enable_simd
 target x86_64 skylake
 
-function %iadd_i32x4() -> b1 {
-block0:
-    v0 = vconst.i32x4 [1 1 1 1]
-    v1 = vconst.i32x4 [1 2 3 4]
+function %iadd_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0:i32x4, v1:i32x4):
     v2 = iadd v0, v1
-
-    v3 = extractlane v2, 0
-    v4 = icmp_imm eq v3, 2
-
-    v5 = extractlane v2, 3
-    v6 = icmp_imm eq v5, 5
-    ; TODO replace extractlanes with vector comparison
-
-    v7 = band v4, v6
-    return v7
+    return v2
 }
-; run
+; run: %iadd_i32x4([1 1 1 1], [1 2 3 4]) == [2 3 4 5]
 
-function %iadd_i8x16_with_overflow() -> b1 {
+function %iadd_i8x16_with_overflow() -> i8x16 {
 block0:
     v0 = vconst.i8x16 [255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255]
     v1 = vconst.i8x16 [2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2]
     v2 = iadd v0, v1
-
-    v3 = extractlane v2, 0
-    v4 = icmp_imm eq v3, 1
-    ; TODO replace extractlane with vector comparison
-
-    return v4
+    return v2
 }
-; run
+; run: %iadd_i8x16_with_overflow() == [1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]
 
 function %isub_i32x4_rex() -> b1 {
 block0:
@@ -64,6 +48,13 @@ block0:
     return v4
 }
 ; run
+
+function %imul_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = imul v0, v1
+    return v2
+}
+; run: %imul_i64x2([0 2], [0 2]) == [0 4]
 
 function %imul_i32x4() -> b1 {
 block0:
@@ -201,31 +192,31 @@ block0:
 }
 ; run
 
-function %fmax_f64x2() -> b1 {
-block0:
-    v0 = vconst.f64x2 [-0.0 -0x1.0]
-    v1 = vconst.f64x2 [+0.0 +0x1.0]
-
+function %fmax_f64x2(f64x2, f64x2) -> f64x2 {
+block0(v0: f64x2, v1: f64x2):
     v2 = fmax v0, v1
-    v3 = fcmp eq v2, v1
-    v4 = vall_true v3
-
-    return v4
+    return v2
 }
-; run
+; note below how NaNs are quieted but (unlike fmin), retain their sign: this discrepancy is allowed by non-determinism
+; in the spec, see https://webassembly.github.io/spec/core/bikeshed/index.html#nan-propagation%E2%91%A0.
+; run: %fmax_f64x2([-0x0.0 -0x1.0], [+0x0.0 0x1.0]) == [+0x0.0 0x1.0]
+; run: %fmax_f64x2([-NaN NaN], [0x0.0 0x100.0]) == [-NaN NaN]
+; run: %fmax_f64x2([NaN 0.0], [0.0 0.0]) == [NaN 0.0]
+; run: %fmax_f64x2([-NaN 0.0], [0x1.0 0.0]) == [-NaN 0.0]
+; run: %fmax_f64x2([NaN:0x42 0.0], [0x1.0 0.0]) == [NaN 0.0]
 
-function %fmin_f64x2() -> b1 {
-block0:
-    v0 = vconst.f64x2 [-0x1.0 -0x1.0]
-    v1 = vconst.f64x2 [+0.0 +0x1.0]
-
+function %fmin_f64x2(f64x2, f64x2) -> f64x2 {
+block0(v0: f64x2, v1: f64x2):
     v2 = fmin v0, v1
-    v3 = fcmp eq v2, v0
-    v4 = vall_true v3
-
-    return v4
+    return v2
 }
-; run
+; note below how NaNs are quieted and negative: this is due to non-determinism in the spec for NaNs, see
+; https://webassembly.github.io/spec/core/bikeshed/index.html#nan-propagation%E2%91%A0.
+; run: %fmin_f64x2([-0x0.0 -0x1.0], [+0x0.0 0x1.0]) == [-0x0.0 -0x1.0]
+; run: %fmin_f64x2([-NaN 0x100.0], [0.0 NaN]) == [-NaN -NaN]
+; run: %fmin_f64x2([NaN 0.0], [0.0 0.0]) == [-NaN 0.0]
+; run: %fmin_f64x2([-NaN 0.0], [0x1.0 0.0]) == [-NaN 0.0]
+; run: %fmin_f64x2([NaN:0x42 0.0], [0x1.0 0.0]) == [-NaN 0.0]
 
 function %fneg_f64x2() -> b1 {
 block0:
@@ -279,3 +270,10 @@ block0:
     return v5
 }
 ; run
+
+function %iabs(i32x4) -> i32x4 {
+block0(v0: i32x4):
+    v1 = iabs v0
+    return v1
+}
+; run: %iabs([-42 -1 0 1]) == [42 1 0 1]

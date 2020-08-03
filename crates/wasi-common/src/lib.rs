@@ -21,21 +21,24 @@
     )
 )]
 
-mod clock;
 mod ctx;
 mod entry;
-mod fd;
 mod fdpool;
 pub mod fs;
+mod handle;
 pub mod old;
 mod path;
 mod poll;
 mod sandboxed_tty_writer;
 pub mod snapshots;
 mod sys;
-mod virtfs;
+pub mod virtfs;
 pub mod wasi;
 
-pub use ctx::{WasiCtx, WasiCtxBuilder};
+pub use ctx::{WasiCtx, WasiCtxBuilder, WasiCtxBuilderError};
+pub use handle::{Handle, HandleRights};
+pub use sys::osdir::OsDir;
+pub use sys::osfile::OsFile;
+pub use sys::osother::OsOther;
 pub use sys::preopen_dir;
 pub use virtfs::{FileContents, VirtualDirEntry};

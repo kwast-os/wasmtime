@@ -1,11 +1,14 @@
-use crate::entry::Descriptor;
+use crate::handle::Handle;
 use crate::poll::{ClockEventData, FdEventData};
+use crate::sys::osdir::OsDir;
+use crate::sys::osfile::OsFile;
+use crate::sys::osother::OsOther;
+use crate::sys::stdio::{Stderr, Stdin, Stdout};
+use crate::sys::AsFile;
 use crate::wasi::{types, Errno, Result};
 use lazy_static::lazy_static;
 use log::{debug, error, trace, warn};
 use std::convert::TryInto;
-use std::os::windows::io::AsRawHandle;
-use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Mutex;
 use std::thread;
@@ -141,27 +144,31 @@ fn handle_timeout_event(timeout_event: ClockEventData, events: &mut Vec<types::E
 }
 
 fn handle_rw_event(event: FdEventData, out_events: &mut Vec<types::Event>) {
-    let size = match &*event.descriptor.borrow() {
-        Descriptor::OsHandle(os_handle) => {
-            if event.r#type == types::Eventtype::FdRead {
-                os_handle.metadata().map(|m| m.len()).map_err(Into::into)
-            } else {
-                // The spec is unclear what nbytes should actually be for __WASI_EVENTTYPE_FD_WRITE and
-                // the implementation on Unix just returns 0 here, so it's probably fine
-                // to do the same on Windows for now.
-                // cf. https://github.com/WebAssembly/WASI/issues/148
-                Ok(0)
-            }
-        }
+    let handle = &event.handle;
+    let size = if let Some(_) = handle.as_any().downcast_ref::<Stdin>() {
         // We return the only universally correct lower bound, see the comment later in the function.
-        Descriptor::Stdin => Ok(1),
+        Ok(1)
+    } else if let Some(_) = handle.as_any().downcast_ref::<Stdout>() {
+        // On Unix, ioctl(FIONREAD) will return 0 for stdout. Emulate the same behavior on Windows.
+        Ok(0)
+    } else if let Some(_) = handle.as_any().downcast_ref::<Stderr>() {
         // On Unix, ioctl(FIONREAD) will return 0 for stdout/stderr. Emulate the same behavior on Windows.
-        Descriptor::Stdout | Descriptor::Stderr => Ok(0),
-        Descriptor::VirtualFile(_) => {
-            panic!("virtual files do not get rw events");
+        Ok(0)
+    } else {
+        if event.r#type == types::Eventtype::FdRead {
+            handle
+                .as_file()
+                .and_then(|f| f.metadata())
+                .map(|m| m.len())
+                .map_err(Into::into)
+        } else {
+            // The spec is unclear what nbytes should actually be for __WASI_EVENTTYPE_FD_WRITE and
+            // the implementation on Unix just returns 0 here, so it's probably fine
+            // to do the same on Windows for now.
+            // cf. https://github.com/WebAssembly/WASI/issues/148
+            Ok(0)
         }
     };
-
     let new_event = make_rw_event(&event, size);
     out_events.push(new_event);
 }
@@ -201,36 +208,42 @@ pub(crate) fn oneoff(
     let mut pipe_events = vec![];
 
     for event in fd_events {
-        let descriptor = Rc::clone(&event.descriptor);
-        match &*descriptor.borrow() {
-            Descriptor::Stdin if event.r#type == types::Eventtype::FdRead => {
-                stdin_events.push(event)
-            }
-            // stdout/stderr are always considered ready to write because there seems to
+        let handle = &event.handle;
+        if let Some(_) = handle.as_any().downcast_ref::<OsFile>() {
+            immediate_events.push(event);
+        } else if let Some(_) = handle.as_any().downcast_ref::<OsDir>() {
+            immediate_events.push(event);
+        } else if let Some(_) = handle.as_any().downcast_ref::<Stdin>() {
+            stdin_events.push(event);
+        } else if let Some(_) = handle.as_any().downcast_ref::<Stdout>() {
+            // stdout are always considered ready to write because there seems to
             // be no way of checking if a write to stdout would block.
             //
             // If stdin is polled for anything else then reading, then it is also
             // considered immediately ready, following the behavior on Linux.
-            Descriptor::Stdin | Descriptor::Stderr | Descriptor::Stdout => {
-                immediate_events.push(event)
+            immediate_events.push(event);
+        } else if let Some(_) = handle.as_any().downcast_ref::<Stderr>() {
+            // stderr are always considered ready to write because there seems to
+            // be no way of checking if a write to stdout would block.
+            //
+            // If stdin is polled for anything else then reading, then it is also
+            // considered immediately ready, following the behavior on Linux.
+            immediate_events.push(event);
+        } else if let Some(other) = handle.as_any().downcast_ref::<OsOther>() {
+            if other.get_file_type() == types::Filetype::SocketStream {
+                // We map pipe to SocketStream
+                pipe_events.push(event);
+            } else {
+                debug!(
+                    "poll_oneoff: unsupported file type: {}",
+                    other.get_file_type()
+                );
+                handle_error_event(event, Errno::Notsup, events);
             }
-            Descriptor::OsHandle(os_handle) => {
-                let ftype = unsafe { winx::file::get_file_type(os_handle.as_raw_handle()) }?;
-                if ftype.is_unknown() || ftype.is_char() {
-                    debug!("poll_oneoff: unsupported file type: {:?}", ftype);
-                    handle_error_event(event, Errno::Notsup, events);
-                } else if ftype.is_disk() {
-                    immediate_events.push(event);
-                } else if ftype.is_pipe() {
-                    pipe_events.push(event);
-                } else {
-                    unreachable!();
-                }
-            }
-            Descriptor::VirtualFile(_) => {
-                panic!("virtual files do not get rw events");
-            }
-        };
+        } else {
+            log::error!("can poll FdEvent for OS resources only");
+            return Err(Errno::Badf);
+        }
     }
 
     let immediate = !immediate_events.is_empty();

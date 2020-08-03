@@ -13,11 +13,15 @@
 pub mod dummy;
 
 use dummy::dummy_imports;
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use wasmtime::*;
+use wasmtime_wast::WastContext;
+
+static CNT: AtomicUsize = AtomicUsize::new(0);
 
 fn log_wasm(wasm: &[u8]) {
-    static CNT: AtomicUsize = AtomicUsize::new(0);
     if !log::log_enabled!(log::Level::Debug) {
         return;
     }
@@ -30,6 +34,16 @@ fn log_wasm(wasm: &[u8]) {
         let name = format!("testcase{}.wat", i);
         std::fs::write(&name, s).expect("failed to write wat file");
     }
+}
+
+fn log_wat(wat: &str) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+
+    let i = CNT.fetch_add(1, SeqCst);
+    let name = format!("testcase{}.wat", i);
+    std::fs::write(&name, wat).expect("failed to write wat file");
 }
 
 /// Instantiate the Wasm buffer, and implicitly fail if we have an unexpected
@@ -55,7 +69,7 @@ pub fn instantiate_with_config(wasm: &[u8], config: Config) {
     let store = Store::new(&engine);
 
     log_wasm(wasm);
-    let module = match Module::new(&store, wasm) {
+    let module = match Module::new(&engine, wasm) {
         Ok(module) => module,
         Err(_) => return,
     };
@@ -64,7 +78,7 @@ pub fn instantiate_with_config(wasm: &[u8], config: Config) {
         Ok(imps) => imps,
         Err(_) => {
             // There are some value types that we can't synthesize a
-            // dummy value for (e.g. anyrefs) and for modules that
+            // dummy value for (e.g. externrefs) and for modules that
             // import things of these types we skip instantiation.
             return;
         }
@@ -74,7 +88,7 @@ pub fn instantiate_with_config(wasm: &[u8], config: Config) {
     // aren't caught during validation or compilation. For example, an imported
     // table might not have room for an element segment that we want to
     // initialize into it.
-    let _result = Instance::new(&module, &imports);
+    let _result = Instance::new(&store, &module, &imports);
 }
 
 /// Compile the Wasm buffer, and implicitly fail if we have an unexpected
@@ -87,9 +101,8 @@ pub fn compile(wasm: &[u8], strategy: Strategy) {
     crate::init_fuzzing();
 
     let engine = Engine::new(&crate::fuzz_default_config(strategy).unwrap());
-    let store = Store::new(&engine);
     log_wasm(wasm);
-    let _ = Module::new(&store, wasm);
+    let _ = Module::new(&engine, wasm);
 }
 
 /// Instantiate the given Wasm module with each `Config` and call all of its
@@ -127,7 +140,7 @@ pub fn differential_execution(
         let engine = Engine::new(config);
         let store = Store::new(&engine);
 
-        let module = match Module::new(&store, &ttf.wasm) {
+        let module = match Module::new(&engine, &ttf.wasm) {
             Ok(module) => module,
             // The module might rely on some feature that our config didn't
             // enable or something like that.
@@ -146,7 +159,7 @@ pub fn differential_execution(
             Ok(imps) => imps,
             Err(e) => {
                 // There are some value types that we can't synthesize a
-                // dummy value for (e.g. anyrefs) and for modules that
+                // dummy value for (e.g. externrefs) and for modules that
                 // import things of these types we skip instantiation.
                 eprintln!("Warning: failed to synthesize dummy imports: {}", e);
                 continue;
@@ -157,7 +170,7 @@ pub fn differential_execution(
         // aren't caught during validation or compilation. For example, an imported
         // table might not have room for an element segment that we want to
         // initialize into it.
-        let instance = match Instance::new(&module, &imports) {
+        let instance = match Instance::new(&store, &module, &imports) {
             Ok(instance) => instance,
             Err(e) => {
                 eprintln!(
@@ -168,30 +181,13 @@ pub fn differential_execution(
             }
         };
 
-        let funcs = module
-            .exports()
-            .iter()
-            .filter_map(|e| {
-                if let ExternType::Func(_) = e.ty() {
-                    Some(e.name())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        for name in funcs {
+        for (name, f) in instance.exports().filter_map(|e| {
+            let name = e.name();
+            e.into_func().map(|f| (name, f))
+        }) {
             // Always call the hang limit initializer first, so that we don't
             // infinite loop when calling another export.
             init_hang_limit(&instance);
-
-            let f = match instance
-                .get_export(&name)
-                .expect("instance should have export from module")
-            {
-                Extern::Func(f) => f.clone(),
-                _ => panic!("export should be a function"),
-            };
 
             let ty = f.ty();
             let params = match dummy::dummy_values(ty.params()) {
@@ -260,9 +256,8 @@ pub fn differential_execution(
                                 fail()
                             }
                         }
-                        (Val::AnyRef(_), Val::AnyRef(_)) | (Val::FuncRef(_), Val::FuncRef(_)) => {
-                            continue
-                        }
+                        (Val::ExternRef(_), Val::ExternRef(_))
+                        | (Val::FuncRef(_), Val::FuncRef(_)) => continue,
                         _ => fail(),
                     }
                 }
@@ -291,14 +286,17 @@ pub fn make_api_calls(api: crate::generators::api::ApiCalls) {
             ApiCall::ConfigNew => {
                 log::trace!("creating config");
                 assert!(config.is_none());
-                let mut cfg = Config::new();
-                cfg.cranelift_debug_verifier(true);
-                config = Some(cfg);
+                config = Some(crate::fuzz_default_config(wasmtime::Strategy::Cranelift).unwrap());
             }
 
             ApiCall::ConfigDebugInfo(b) => {
                 log::trace!("enabling debuginfo");
                 config.as_mut().unwrap().debug_info(b);
+            }
+
+            ApiCall::ConfigInterruptable(b) => {
+                log::trace!("enabling interruption");
+                config.as_mut().unwrap().interruptable(b);
             }
 
             ApiCall::EngineNew => {
@@ -316,7 +314,7 @@ pub fn make_api_calls(api: crate::generators::api::ApiCalls) {
             ApiCall::ModuleNew { id, wasm } => {
                 log::debug!("creating module: {}", id);
                 log_wasm(&wasm.wasm);
-                let module = match Module::new(store.as_ref().unwrap(), &wasm.wasm) {
+                let module = match Module::new(engine.as_ref().unwrap(), &wasm.wasm) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
@@ -336,11 +334,13 @@ pub fn make_api_calls(api: crate::generators::api::ApiCalls) {
                     None => continue,
                 };
 
-                let imports = match dummy_imports(store.as_ref().unwrap(), module.imports()) {
+                let store = store.as_ref().unwrap();
+
+                let imports = match dummy_imports(store, module.imports()) {
                     Ok(imps) => imps,
                     Err(_) => {
                         // There are some value types that we can't synthesize a
-                        // dummy value for (e.g. anyrefs) and for modules that
+                        // dummy value for (e.g. externrefs) and for modules that
                         // import things of these types we skip instantiation.
                         continue;
                     }
@@ -350,7 +350,7 @@ pub fn make_api_calls(api: crate::generators::api::ApiCalls) {
                 // aren't caught during validation or compilation. For example, an imported
                 // table might not have room for an element segment that we want to
                 // initialize into it.
-                if let Ok(instance) = Instance::new(&module, &imports) {
+                if let Ok(instance) = Instance::new(store, &module, &imports) {
                     instances.insert(id, instance);
                 }
             }
@@ -377,8 +377,7 @@ pub fn make_api_calls(api: crate::generators::api::ApiCalls) {
 
                 let funcs = instance
                     .exports()
-                    .iter()
-                    .filter_map(|e| match e {
+                    .filter_map(|e| match e.into_extern() {
                         Extern::Func(f) => Some(f.clone()),
                         _ => None,
                     })
@@ -397,6 +396,72 @@ pub fn make_api_calls(api: crate::generators::api::ApiCalls) {
                 };
                 let _ = f.call(&params);
             }
+        }
+    }
+}
+
+/// Executes the wast `test` spectest with the `config` specified.
+///
+/// Ensures that spec tests pass regardless of the `Config`.
+pub fn spectest(config: crate::generators::Config, test: crate::generators::SpecTest) {
+    crate::init_fuzzing();
+    log::debug!("running {:?} with {:?}", test.file, config);
+    let store = Store::new(&Engine::new(&config.to_wasmtime()));
+    let mut wast_context = WastContext::new(store);
+    wast_context.register_spectest().unwrap();
+    wast_context
+        .run_buffer(test.file, test.contents.as_bytes())
+        .unwrap();
+}
+
+/// Execute a series of `table.get` and `table.set` operations.
+pub fn table_ops(config: crate::generators::Config, ops: crate::generators::table_ops::TableOps) {
+    let _ = env_logger::try_init();
+
+    let num_dropped = Rc::new(Cell::new(0));
+
+    {
+        let mut config = config.to_wasmtime();
+        config.wasm_reference_types(true);
+        let engine = Engine::new(&config);
+        let store = Store::new(&engine);
+
+        let wat = ops.to_wat_string();
+        log_wat(&wat);
+        let module = match Module::new(&engine, &wat) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+
+        // To avoid timeouts, limit the number of explicit GCs we perform per
+        // test case.
+        const MAX_GCS: usize = 5;
+
+        let num_gcs = Cell::new(0);
+        let gc = Func::wrap(&store, move |caller: Caller| {
+            if num_gcs.get() < MAX_GCS {
+                caller.store().gc();
+                num_gcs.set(num_gcs.get() + 1);
+            }
+        });
+
+        let instance = Instance::new(&store, &module, &[gc.into()]).unwrap();
+        let run = instance.get_func("run").unwrap();
+
+        let args: Vec<_> = (0..ops.num_params())
+            .map(|_| Val::ExternRef(Some(ExternRef::new(CountDrops(num_dropped.clone())))))
+            .collect();
+        let _ = run.call(&args);
+    }
+
+    assert_eq!(num_dropped.get(), ops.num_params());
+    return;
+
+    struct CountDrops(Rc<Cell<u8>>);
+
+    impl Drop for CountDrops {
+        fn drop(&mut self) {
+            self.0.set(self.0.get().checked_add(1).unwrap());
         }
     }
 }

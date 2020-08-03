@@ -1,6 +1,24 @@
 //! Offsets and sizes of various structs in wasmtime-runtime's vmcontext
 //! module.
 
+// Currently the `VMContext` allocation by field looks like this:
+//
+// struct VMContext {
+//      interrupts: *const VMInterrupts,
+//      externref_activations_table: *mut VMExternRefActivationsTable,
+//      stack_map_registry: *mut StackMapRegistry,
+//      signature_ids: [VMSharedSignatureIndex; module.num_signature_ids],
+//      imported_functions: [VMFunctionImport; module.num_imported_functions],
+//      imported_tables: [VMTableImport; module.num_imported_tables],
+//      imported_memories: [VMMemoryImport; module.num_imported_memories],
+//      imported_globals: [VMGlobalImport; module.num_imported_globals],
+//      tables: [VMTableDefinition; module.num_defined_tables],
+//      memories: [VMMemoryDefinition; module.num_defined_memories],
+//      globals: [VMGlobalDefinition; module.num_defined_globals],
+//      anyfuncs: [VMCallerCheckedAnyfunc; module.num_imported_functions + module.num_defined_functions],
+//      builtins: VMBuiltinFunctionsArray,
+// }
+
 use crate::module::ModuleLocal;
 use crate::BuiltinFunctionIndex;
 use cranelift_codegen::ir;
@@ -10,6 +28,11 @@ use cranelift_wasm::{
 };
 use more_asserts::assert_lt;
 use std::convert::TryFrom;
+
+/// Sentinel value indicating that wasm has been interrupted.
+// Note that this has a bit of an odd definition. See the `insert_stack_check`
+// function in `cranelift/codegen/src/isa/x86/abi.rs` for more information
+pub const INTERRUPTED: usize = usize::max_value() - 32 * 1024;
 
 #[cfg(target_pointer_width = "32")]
 fn cast_to_u32(sz: usize) -> u32 {
@@ -40,6 +63,8 @@ pub struct VMOffsets {
     pub num_imported_memories: u32,
     /// The number of imported globals in the module.
     pub num_imported_globals: u32,
+    /// The number of defined functions in the module.
+    pub num_defined_functions: u32,
     /// The number of defined tables in the module.
     pub num_defined_tables: u32,
     /// The number of defined memories in the module.
@@ -58,6 +83,7 @@ impl VMOffsets {
             num_imported_tables: cast_to_u32(module.num_imported_tables),
             num_imported_memories: cast_to_u32(module.num_imported_memories),
             num_imported_globals: cast_to_u32(module.num_imported_globals),
+            num_defined_functions: cast_to_u32(module.functions.len()),
             num_defined_tables: cast_to_u32(module.table_plans.len()),
             num_defined_memories: cast_to_u32(module.memory_plans.len()),
             num_defined_globals: cast_to_u32(module.globals.len()),
@@ -226,6 +252,14 @@ impl VMOffsets {
     }
 }
 
+/// Offsets for `VMInterrupts`.
+impl VMOffsets {
+    /// Return the offset of the `stack_limit` field of `VMInterrupts`
+    pub fn vminterrupts_stack_limit(&self) -> u8 {
+        0
+    }
+}
+
 /// Offsets for `VMCallerCheckedAnyfunc`.
 impl VMOffsets {
     /// The offset of the `func_ptr` field.
@@ -253,9 +287,30 @@ impl VMOffsets {
 
 /// Offsets for `VMContext`.
 impl VMOffsets {
+    /// Return the offset to the `VMInterrupts` structure
+    pub fn vmctx_interrupts(&self) -> u32 {
+        0
+    }
+
+    /// The offset of the `VMExternRefActivationsTable` member.
+    pub fn vmctx_externref_activations_table(&self) -> u32 {
+        self.vmctx_interrupts()
+            .checked_add(u32::from(self.pointer_size))
+            .unwrap()
+    }
+
+    /// The offset of the `*mut StackMapRegistry` member.
+    pub fn vmctx_stack_map_registry(&self) -> u32 {
+        self.vmctx_externref_activations_table()
+            .checked_add(u32::from(self.pointer_size))
+            .unwrap()
+    }
+
     /// The offset of the `signature_ids` array.
     pub fn vmctx_signature_ids_begin(&self) -> u32 {
-        0
+        self.vmctx_stack_map_registry()
+            .checked_add(u32::from(self.pointer_size))
+            .unwrap()
     }
 
     /// The offset of the `tables` array.
@@ -339,12 +394,25 @@ impl VMOffsets {
         align(offset, 16)
     }
 
-    /// The offset of the builtin functions array.
-    pub fn vmctx_builtin_functions_begin(&self) -> u32 {
+    /// The offset of the `anyfuncs` array.
+    pub fn vmctx_anyfuncs_begin(&self) -> u32 {
         self.vmctx_globals_begin()
             .checked_add(
                 self.num_defined_globals
                     .checked_mul(u32::from(self.size_of_vmglobal_definition()))
+                    .unwrap(),
+            )
+            .unwrap()
+    }
+
+    /// The offset of the builtin functions array.
+    pub fn vmctx_builtin_functions_begin(&self) -> u32 {
+        self.vmctx_anyfuncs_begin()
+            .checked_add(
+                self.num_imported_functions
+                    .checked_add(self.num_defined_functions)
+                    .unwrap()
+                    .checked_mul(u32::from(self.size_of_vmcaller_checked_anyfunc()))
                     .unwrap(),
             )
             .unwrap()
@@ -465,6 +533,19 @@ impl VMOffsets {
             .unwrap()
     }
 
+    /// Return the offset to the `VMCallerCheckedAnyfunc` for the given function
+    /// index (either imported or defined).
+    pub fn vmctx_anyfunc(&self, index: FuncIndex) -> u32 {
+        self.vmctx_anyfuncs_begin()
+            .checked_add(
+                index
+                    .as_u32()
+                    .checked_mul(u32::from(self.size_of_vmcaller_checked_anyfunc()))
+                    .unwrap(),
+            )
+            .unwrap()
+    }
+
     /// Return the offset to the `body` field in `*const VMFunctionBody` index `index`.
     pub fn vmctx_vmfunction_import_body(&self, index: FuncIndex) -> u32 {
         self.vmctx_vmfunction_import(index)
@@ -545,6 +626,27 @@ impl VMOffsets {
                     .unwrap(),
             )
             .unwrap()
+    }
+}
+
+/// Offsets for `VMExternData`.
+impl VMOffsets {
+    /// Return the offset for `VMExternData::ref_count`.
+    pub fn vm_extern_data_ref_count() -> u32 {
+        0
+    }
+}
+
+/// Offsets for `VMExternRefActivationsTable`.
+impl VMOffsets {
+    /// Return the offset for `VMExternRefActivationsTable::next`.
+    pub fn vm_extern_ref_activation_table_next(&self) -> u32 {
+        0
+    }
+
+    /// Return the offset for `VMExternRefActivationsTable::end`.
+    pub fn vm_extern_ref_activation_table_end(&self) -> u32 {
+        self.pointer_size.into()
     }
 }
 

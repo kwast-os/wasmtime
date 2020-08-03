@@ -1,7 +1,10 @@
 use proptest::prelude::*;
 use std::cell::UnsafeCell;
 use std::marker;
-use wiggle::GuestMemory;
+use wiggle::{BorrowHandle, GuestMemory, Region};
+
+mod borrow;
+use borrow::BorrowChecker;
 
 #[derive(Debug, Clone)]
 pub struct MemAreas(Vec<MemArea>);
@@ -43,13 +46,21 @@ impl Into<Vec<MemArea>> for MemAreas {
 }
 
 #[repr(align(4096))]
+struct HostBuffer {
+    cell: UnsafeCell<[u8; 4096]>,
+}
+
 pub struct HostMemory {
-    buffer: UnsafeCell<[u8; 4096]>,
+    buffer: HostBuffer,
+    bc: BorrowChecker,
 }
 impl HostMemory {
     pub fn new() -> Self {
         HostMemory {
-            buffer: UnsafeCell::new([0; 4096]),
+            buffer: HostBuffer {
+                cell: UnsafeCell::new([0; 4096]),
+            },
+            bc: BorrowChecker::new(),
         }
     }
 
@@ -107,9 +118,21 @@ impl HostMemory {
 unsafe impl GuestMemory for HostMemory {
     fn base(&self) -> (*mut u8, u32) {
         unsafe {
-            let ptr = self.buffer.get();
+            let ptr = self.buffer.cell.get();
             ((*ptr).as_mut_ptr(), (*ptr).len() as u32)
         }
+    }
+    fn has_outstanding_borrows(&self) -> bool {
+        self.bc.has_outstanding_borrows()
+    }
+    fn is_borrowed(&self, r: Region) -> bool {
+        self.bc.is_borrowed(r)
+    }
+    fn borrow(&self, r: Region) -> Result<BorrowHandle, GuestError> {
+        self.bc.borrow(r)
+    }
+    fn unborrow(&self, h: BorrowHandle) {
+        self.bc.unborrow(h)
     }
 }
 
@@ -295,6 +318,7 @@ use wiggle::GuestError;
 // on the test as well.
 pub struct WasiCtx<'a> {
     pub guest_errors: RefCell<Vec<GuestError>>,
+    pub log: RefCell<Vec<String>>,
     lifetime: marker::PhantomData<&'a ()>,
 }
 
@@ -302,6 +326,7 @@ impl<'a> WasiCtx<'a> {
     pub fn new() -> Self {
         Self {
             guest_errors: RefCell::new(vec![]),
+            log: RefCell::new(vec![]),
             lifetime: marker::PhantomData,
         }
     }
@@ -322,6 +347,7 @@ macro_rules! impl_errno {
         impl<'a> $convert for WasiCtx<'a> {
             fn into_errno(&self, e: wiggle::GuestError) -> $errno {
                 eprintln!("GuestError: {:?}", e);
+                self.guest_errors.borrow_mut().push(e);
                 <$errno>::InvalidArg
             }
         }

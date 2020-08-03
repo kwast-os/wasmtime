@@ -2,6 +2,8 @@
 //! [Wasm C API](https://github.com/WebAssembly/wasm-c-api).
 
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+#![allow(unknown_lints)]
+#![allow(improper_ctypes_definitions)]
 
 // TODO complete the C API
 
@@ -63,15 +65,13 @@ pub struct wasm_shared_module_t {
     _unused: [u8; 0],
 }
 
-struct HostInfoState {
-    info: *mut std::ffi::c_void,
-    finalizer: Option<extern "C" fn(arg1: *mut std::ffi::c_void)>,
-}
-
-impl Drop for HostInfoState {
-    fn drop(&mut self) {
-        if let Some(f) = &self.finalizer {
-            f(self.info);
-        }
+/// Initialize a `MaybeUninit<T>`
+///
+/// TODO: Replace calls to this function with
+/// https://doc.rust-lang.org/nightly/std/mem/union.MaybeUninit.html#method.write
+/// once it is stable.
+pub(crate) fn initialize<T>(dst: &mut std::mem::MaybeUninit<T>, val: T) {
+    unsafe {
+        std::ptr::write(dst.as_mut_ptr(), val);
     }
 }

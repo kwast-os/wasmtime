@@ -71,18 +71,20 @@ pub fn declare_ref(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         }
 
         #[no_mangle]
-        pub extern fn #same(a: &#ty, b: &#ty) -> bool {
-            a.anyref().ptr_eq(&b.anyref())
+        pub extern fn #same(_a: &#ty, _b: &#ty) -> bool {
+            eprintln!("`{}` is not implemented", stringify!(#same));
+            std::process::abort();
         }
 
         #[no_mangle]
         pub extern fn #get_host_info(a: &#ty) -> *mut std::os::raw::c_void {
-            crate::r#ref::get_host_info(&a.anyref())
+            std::ptr::null_mut()
         }
 
         #[no_mangle]
         pub extern fn #set_host_info(a: &#ty, info: *mut std::os::raw::c_void) {
-            crate::r#ref::set_host_info(&a.anyref(), info, None)
+            eprintln!("`{}` is not implemented", stringify!(#set_host_info));
+            std::process::abort();
         }
 
         #[no_mangle]
@@ -91,18 +93,20 @@ pub fn declare_ref(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
             info: *mut std::os::raw::c_void,
             finalizer: Option<extern "C" fn(*mut std::os::raw::c_void)>,
         ) {
-            crate::r#ref::set_host_info(&a.anyref(), info, finalizer)
+            eprintln!("`{}` is not implemented", stringify!(#set_host_info_final));
+            std::process::abort();
         }
 
         #[no_mangle]
         pub extern fn #as_ref(a: &#ty) -> Box<crate::wasm_ref_t> {
-            let r = a.anyref();
-            Box::new(crate::wasm_ref_t { r })
+            eprintln!("`{}` is not implemented", stringify!(#as_ref));
+            std::process::abort();
         }
 
         #[no_mangle]
         pub extern fn #as_ref_const(a: &#ty) -> Box<crate::wasm_ref_t> {
-            #as_ref(a)
+            eprintln!("`{}` is not implemented", stringify!(#as_ref_const));
+            std::process::abort();
         }
 
         // TODO: implement `wasm_ref_as_#name#`

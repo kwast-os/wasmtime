@@ -22,6 +22,7 @@
 )]
 
 mod export;
+mod externref;
 mod imports;
 mod instance;
 mod jit_int;
@@ -29,28 +30,51 @@ mod memory;
 mod mmap;
 mod sig_registry;
 mod table;
-mod trap_registry;
 mod traphandlers;
 mod vmcontext;
 
+pub mod debug_builtins;
 pub mod libcalls;
 
 pub use crate::export::*;
+pub use crate::externref::*;
 pub use crate::imports::Imports;
 pub use crate::instance::{InstanceHandle, InstantiationError, LinkError};
 pub use crate::jit_int::GdbJitImageRegistration;
 pub use crate::memory::{RuntimeLinearMemory, RuntimeMemoryCreator};
 pub use crate::mmap::Mmap;
 pub use crate::sig_registry::SignatureRegistry;
-pub use crate::table::Table;
-pub use crate::trap_registry::{TrapDescription, TrapRegistration, TrapRegistry};
-pub use crate::traphandlers::resume_panic;
-pub use crate::traphandlers::{catch_traps, raise_lib_trap, raise_user_trap, Trap};
+pub use crate::table::{Table, TableElement};
+pub use crate::traphandlers::{
+    catch_traps, init_traps, raise_lib_trap, raise_user_trap, resume_panic, SignalHandler, Trap,
+};
 pub use crate::vmcontext::{
     VMCallerCheckedAnyfunc, VMContext, VMFunctionBody, VMFunctionImport, VMGlobalDefinition,
-    VMGlobalImport, VMInvokeArgument, VMMemoryDefinition, VMMemoryImport, VMSharedSignatureIndex,
-    VMTableDefinition, VMTableImport, VMTrampoline,
+    VMGlobalImport, VMInterrupts, VMInvokeArgument, VMMemoryDefinition, VMMemoryImport,
+    VMSharedSignatureIndex, VMTableDefinition, VMTableImport, VMTrampoline,
 };
 
 /// Version number of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The Cranelift IR type used for reference types for this target architecture.
+pub fn ref_type() -> wasmtime_environ::ir::Type {
+    if cfg!(target_pointer_width = "32") {
+        wasmtime_environ::ir::types::R32
+    } else if cfg!(target_pointer_width = "64") {
+        wasmtime_environ::ir::types::R64
+    } else {
+        unreachable!()
+    }
+}
+
+/// The Cranelift IR type used for pointer types for this target architecture.
+pub fn pointer_type() -> wasmtime_environ::ir::Type {
+    if cfg!(target_pointer_width = "32") {
+        wasmtime_environ::ir::types::I32
+    } else if cfg!(target_pointer_width = "64") {
+        wasmtime_environ::ir::types::I64
+    } else {
+        unreachable!()
+    }
+}

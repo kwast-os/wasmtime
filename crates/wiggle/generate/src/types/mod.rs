@@ -23,10 +23,12 @@ pub fn define_datatype(names: &Names, namedtype: &witx::NamedType) -> TokenStrea
             witx::Type::Handle(h) => handle::define_handle(names, &namedtype.name, &h),
             witx::Type::Builtin(b) => define_builtin(names, &namedtype.name, *b),
             witx::Type::Pointer(p) => {
-                define_witx_pointer(names, &namedtype.name, quote!(wiggle::GuestPtr), p)
+                let rt = names.runtime_mod();
+                define_witx_pointer(names, &namedtype.name, quote!(#rt::GuestPtr), p)
             }
             witx::Type::ConstPointer(p) => {
-                define_witx_pointer(names, &namedtype.name, quote!(wiggle::GuestPtr), p)
+                let rt = names.runtime_mod();
+                define_witx_pointer(names, &namedtype.name, quote!(#rt::GuestPtr), p)
             }
             witx::Type::Array(arr) => define_witx_array(names, &namedtype.name, &arr),
         },
@@ -67,8 +69,9 @@ fn define_witx_pointer(
 
 fn define_witx_array(names: &Names, name: &witx::Id, arr_raw: &witx::TypeRef) -> TokenStream {
     let ident = names.type_(name);
+    let rt = names.runtime_mod();
     let pointee_type = names.type_ref(arr_raw, quote!('a));
-    quote!(pub type #ident<'a> = wiggle::GuestPtr<'a, [#pointee_type]>;)
+    quote!(pub type #ident<'a> = #rt::GuestPtr<'a, [#pointee_type]>;)
 }
 
 fn int_repr_tokens(int_repr: witx::IntRepr) -> TokenStream {
@@ -86,5 +89,58 @@ fn atom_token(atom: witx::AtomType) -> TokenStream {
         witx::AtomType::I64 => quote!(i64),
         witx::AtomType::F32 => quote!(f32),
         witx::AtomType::F64 => quote!(f64),
+    }
+}
+
+pub trait WiggleType {
+    fn impls_display(&self) -> bool;
+}
+
+impl WiggleType for witx::TypeRef {
+    fn impls_display(&self) -> bool {
+        match self {
+            witx::TypeRef::Name(alias_to) => (&*alias_to).impls_display(),
+            witx::TypeRef::Value(v) => (&*v).impls_display(),
+        }
+    }
+}
+
+impl WiggleType for witx::NamedType {
+    fn impls_display(&self) -> bool {
+        self.tref.impls_display()
+    }
+}
+
+impl WiggleType for witx::Type {
+    fn impls_display(&self) -> bool {
+        match self {
+            witx::Type::Enum(x) => x.impls_display(),
+            witx::Type::Int(x) => x.impls_display(),
+            witx::Type::Flags(x) => x.impls_display(),
+            witx::Type::Struct(x) => x.impls_display(),
+            witx::Type::Union(x) => x.impls_display(),
+            witx::Type::Handle(x) => x.impls_display(),
+            witx::Type::Builtin(x) => x.impls_display(),
+            witx::Type::Pointer { .. }
+            | witx::Type::ConstPointer { .. }
+            | witx::Type::Array { .. } => false,
+        }
+    }
+}
+
+impl WiggleType for witx::BuiltinType {
+    fn impls_display(&self) -> bool {
+        true
+    }
+}
+
+impl WiggleType for witx::InterfaceFuncParam {
+    fn impls_display(&self) -> bool {
+        match &*self.tref.type_() {
+            witx::Type::Struct { .. }
+            | witx::Type::Union { .. }
+            | witx::Type::Builtin(witx::BuiltinType::String { .. }) => false,
+            _ => self.tref.impls_display(),
+        }
     }
 }

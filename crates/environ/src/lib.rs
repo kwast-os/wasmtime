@@ -27,7 +27,6 @@
 mod address_map;
 mod compilation;
 mod data_structures;
-mod frame_layout;
 mod func_environ;
 mod module;
 mod module_environ;
@@ -47,25 +46,23 @@ pub use crate::address_map::{
 pub use crate::cache::create_new_config as cache_create_new_config;
 pub use crate::cache::CacheConfig;
 pub use crate::compilation::{
-    Compilation, CompileError, CompiledFunction, CompiledFunctionUnwindInfo,
-    CompiledFunctionUnwindInfoReloc, Compiler, Relocation, RelocationTarget, Relocations,
-    TrapInformation, Traps,
+    Compilation, CompileError, CompiledFunction, Compiler, Relocation, RelocationTarget,
+    Relocations, StackMapInformation, StackMaps, TrapInformation, Traps,
 };
 pub use crate::cranelift::Cranelift;
 pub use crate::data_structures::*;
-pub use crate::frame_layout::{FrameLayout, FrameLayoutChange, FrameLayouts};
 pub use crate::func_environ::BuiltinFunctionIndex;
 #[cfg(feature = "lightbeam")]
 pub use crate::lightbeam::Lightbeam;
 pub use crate::module::{
-    Export, MemoryPlan, MemoryStyle, Module, ModuleLocal, TableElements, TablePlan, TableStyle,
+    EntityIndex, MemoryPlan, MemoryStyle, Module, ModuleLocal, TableElements, TablePlan, TableStyle,
 };
 pub use crate::module_environ::{
     translate_signature, DataInitializer, DataInitializerLocation, FunctionBodyData,
     ModuleEnvironment, ModuleTranslation,
 };
 pub use crate::tunables::Tunables;
-pub use crate::vmoffsets::{TargetSharedSignatureIndex, VMOffsets};
+pub use crate::vmoffsets::{TargetSharedSignatureIndex, VMOffsets, INTERRUPTED};
 
 /// WebAssembly page sizes are defined to be 64KiB.
 pub const WASM_PAGE_SIZE: u32 = 0x10000;
@@ -75,3 +72,43 @@ pub const WASM_MAX_PAGES: u32 = 0x10000;
 
 /// Version number of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub(crate) fn reference_type(
+    wasm_ty: cranelift_wasm::WasmType,
+    pointer_type: ir::Type,
+) -> ir::Type {
+    match wasm_ty {
+        cranelift_wasm::WasmType::FuncRef => pointer_type,
+        cranelift_wasm::WasmType::ExternRef => match pointer_type {
+            ir::types::I32 => ir::types::R32,
+            ir::types::I64 => ir::types::R64,
+            _ => panic!("unsupported pointer type"),
+        },
+        _ => panic!("unsupported Wasm reference type"),
+    }
+}
+
+/// Iterates through all `LibCall` members and all runtime exported functions.
+#[macro_export]
+macro_rules! for_each_libcall {
+    ($op:ident) => {
+        $op![
+            (UdivI64, wasmtime_i64_udiv),
+            (UdivI64, wasmtime_i64_udiv),
+            (SdivI64, wasmtime_i64_sdiv),
+            (UremI64, wasmtime_i64_urem),
+            (SremI64, wasmtime_i64_srem),
+            (IshlI64, wasmtime_i64_ishl),
+            (UshrI64, wasmtime_i64_ushr),
+            (SshrI64, wasmtime_i64_sshr),
+            (CeilF32, wasmtime_f32_ceil),
+            (FloorF32, wasmtime_f32_floor),
+            (TruncF32, wasmtime_f32_trunc),
+            (NearestF32, wasmtime_f32_nearest),
+            (CeilF64, wasmtime_f64_ceil),
+            (FloorF64, wasmtime_f64_floor),
+            (TruncF64, wasmtime_f64_trunc),
+            (NearestF64, wasmtime_f64_nearest)
+        ];
+    };
+}

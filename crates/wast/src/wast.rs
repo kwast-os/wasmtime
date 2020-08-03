@@ -3,6 +3,11 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use std::path::Path;
 use std::str;
 use wasmtime::*;
+use wast::Wat;
+use wast::{
+    parser::{self, ParseBuffer},
+    HeapType,
+};
 
 /// Translate from a `script::Value` to a `RuntimeValue`.
 fn runtime_value(v: &wast::Expression<'_>) -> Result<Val> {
@@ -17,6 +22,9 @@ fn runtime_value(v: &wast::Expression<'_>) -> Result<Val> {
         F32Const(x) => Val::F32(x.bits),
         F64Const(x) => Val::F64(x.bits),
         V128Const(x) => Val::V128(u128::from_le_bytes(x.to_le_bytes())),
+        RefNull(HeapType::Extern) => Val::ExternRef(None),
+        RefNull(HeapType::Func) => Val::FuncRef(None),
+        RefExtern(x) => Val::ExternRef(Some(ExternRef::new(*x))),
         other => bail!("couldn't convert {:?} to a runtime value", other),
     })
 }
@@ -64,7 +72,7 @@ impl WastContext {
         }
     }
 
-    fn get_export(&self, module: Option<&str>, name: &str) -> Result<&Extern> {
+    fn get_export(&self, module: Option<&str>, name: &str) -> Result<Extern> {
         match module {
             Some(module) => self.linker.get_one_by_name(module, name),
             None => self
@@ -77,7 +85,7 @@ impl WastContext {
     }
 
     fn instantiate(&mut self, module: &[u8]) -> Result<Outcome<Instance>> {
-        let module = Module::new(&self.store, module)?;
+        let module = Module::new(self.store.engine(), module)?;
         self.modules.push(module.clone());
         let instance = match self.linker.instantiate(&module) {
             Ok(i) => i,
@@ -112,7 +120,7 @@ impl WastContext {
         let values = exec
             .args
             .iter()
-            .map(runtime_value)
+            .map(|v| runtime_value(v))
             .collect::<Result<Vec<_>>>()?;
         self.invoke(exec.module.map(|i| i.name()), exec.name, &values)
     }
@@ -121,7 +129,7 @@ impl WastContext {
     fn module(&mut self, instance_name: Option<&str>, module: &[u8]) -> Result<()> {
         let instance = match self.instantiate(module)? {
             Outcome::Ok(i) => i,
-            Outcome::Trap(e) => bail!("instantiation failed with: {}", e.message()),
+            Outcome::Trap(e) => return Err(e).context("instantiation failed"),
         };
         if let Some(name) = instance_name {
             self.linker.instance(name, &instance)?;
@@ -154,7 +162,7 @@ impl WastContext {
     ) -> Result<Outcome> {
         let func = self
             .get_export(instance_name, field)?
-            .func()
+            .into_func()
             .ok_or_else(|| anyhow!("no function named `{}`", field))?;
         Ok(match func.call(args) {
             Ok(result) => Outcome::Ok(result.into()),
@@ -166,7 +174,7 @@ impl WastContext {
     fn get(&mut self, instance_name: Option<&str>, field: &str) -> Result<Outcome> {
         let global = self
             .get_export(instance_name, field)?
-            .global()
+            .into_global()
             .ok_or_else(|| anyhow!("no global named `{}`", field))?;
         Ok(Outcome::Ok(vec![global.get()]))
     }
@@ -187,7 +195,7 @@ impl WastContext {
             Outcome::Ok(values) => bail!("expected trap, got {:?}", values),
             Outcome::Trap(t) => t,
         };
-        let actual = trap.message();
+        let actual = trap.to_string();
         if actual.contains(expected)
             // `bulk-memory-operations/bulk.wast` checks for a message that
             // specifies which element is uninitialized, but our traps don't
@@ -233,6 +241,17 @@ impl WastContext {
             Module(mut module) => {
                 let binary = module.encode()?;
                 self.module(module.id.map(|s| s.name()), &binary)?;
+            }
+            QuoteModule { span: _, source } => {
+                let mut module = String::new();
+                for src in source {
+                    module.push_str(str::from_utf8(src)?);
+                    module.push_str(" ");
+                }
+                let buf = ParseBuffer::new(&module)?;
+                let mut wat = parser::parse::<Wat>(&buf)?;
+                let binary = wat.module.encode()?;
+                self.module(wat.module.id.map(|s| s.name()), &binary)?;
             }
             Register {
                 span: _,
@@ -343,6 +362,8 @@ fn is_matching_assert_invalid_error_message(expected: &str, actual: &str) -> boo
         // `elem.wast` and `proposals/bulk-memory-operations/elem.wast` disagree
         // on the expected error message for the same error.
         || (expected.contains("out of bounds") && actual.contains("does not fit"))
+        // slight difference in error messages
+        || (expected.contains("unknown elem segment") && actual.contains("unknown element segment"))
 }
 
 fn extract_lane_as_i8(bytes: u128, lane: usize) -> i8 {
@@ -388,6 +409,19 @@ fn val_matches(actual: &Val, expected: &wast::AssertExpression) -> Result<bool> 
         (Val::F32(a), wast::AssertExpression::F32(b)) => f32_matches(*a, b),
         (Val::F64(a), wast::AssertExpression::F64(b)) => f64_matches(*a, b),
         (Val::V128(a), wast::AssertExpression::V128(b)) => v128_matches(*a, b),
+        (Val::ExternRef(x), wast::AssertExpression::RefNull(HeapType::Extern)) => x.is_none(),
+        (Val::ExternRef(x), wast::AssertExpression::RefExtern(y)) => {
+            if let Some(x) = x {
+                let x = x
+                    .data()
+                    .downcast_ref::<u32>()
+                    .expect("only u32 externrefs created in wast test suites");
+                x == y
+            } else {
+                false
+            }
+        }
+        (Val::FuncRef(x), wast::AssertExpression::RefNull(HeapType::Func)) => x.is_none(),
         _ => bail!(
             "don't know how to compare {:?} and {:?} yet",
             actual,

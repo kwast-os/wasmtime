@@ -65,8 +65,9 @@ use crate::ir;
 use crate::ir::entities::AnyEntity;
 use crate::ir::instructions::{BranchInfo, CallInfo, InstructionFormat, ResolvedConstraint};
 use crate::ir::{
-    types, ArgumentLoc, Block, FuncRef, Function, GlobalValue, Inst, InstructionData, JumpTable,
-    Opcode, SigRef, StackSlot, StackSlotKind, Type, Value, ValueDef, ValueList, ValueLoc,
+    types, ArgumentLoc, Block, Constant, FuncRef, Function, GlobalValue, Inst, InstructionData,
+    JumpTable, Opcode, SigRef, StackSlot, StackSlotKind, Type, Value, ValueDef, ValueList,
+    ValueLoc,
 };
 use crate::isa::TargetIsa;
 use crate::iterators::IteratorExtras;
@@ -733,26 +734,32 @@ impl<'a> Verifier<'a> {
                     ));
                 }
             }
-
             Unary {
                 opcode: Opcode::Bitcast,
                 arg,
             } => {
                 self.verify_bitcast(inst, arg, errors)?;
             }
+            UnaryConst {
+                opcode: Opcode::Vconst,
+                constant_handle,
+                ..
+            } => {
+                self.verify_constant_size(inst, constant_handle, errors)?;
+            }
 
             // Exhaustive list so we can't forget to add new formats
             Unary { .. }
+            | UnaryConst { .. }
             | UnaryImm { .. }
             | UnaryIeee32 { .. }
             | UnaryIeee64 { .. }
             | UnaryBool { .. }
             | Binary { .. }
-            | BinaryImm { .. }
+            | BinaryImm8 { .. }
+            | BinaryImm64 { .. }
             | Ternary { .. }
-            | InsertLane { .. }
-            | ExtractLane { .. }
-            | UnaryConst { .. }
+            | TernaryImm8 { .. }
             | Shuffle { .. }
             | IntCompare { .. }
             | IntCompareImm { .. }
@@ -1068,6 +1075,27 @@ impl<'a> Verifier<'a> {
                     "The bitcast argument {} doesn't fit in a type of {} bits",
                     arg,
                     typ.lane_bits()
+                ),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn verify_constant_size(
+        &self,
+        inst: Inst,
+        constant: Constant,
+        errors: &mut VerifierErrors,
+    ) -> VerifierStepResult<()> {
+        let type_size = self.func.dfg.ctrl_typevar(inst).bytes() as usize;
+        let constant_size = self.func.dfg.constants.get(constant).len();
+        if type_size != constant_size {
+            errors.fatal((
+                inst,
+                format!(
+                    "The instruction expects {} to have a size of {} bytes but it has {}",
+                    constant, type_size, constant_size
                 ),
             ))
         } else {
@@ -1884,20 +1912,20 @@ impl<'a> Verifier<'a> {
                     Ok(())
                 }
             }
-            ir::InstructionData::ExtractLane {
+            ir::InstructionData::BinaryImm8 {
                 opcode: ir::instructions::Opcode::Extractlane,
-                lane,
+                imm: lane,
                 arg,
                 ..
             }
-            | ir::InstructionData::InsertLane {
+            | ir::InstructionData::TernaryImm8 {
                 opcode: ir::instructions::Opcode::Insertlane,
-                lane,
+                imm: lane,
                 args: [arg, _],
                 ..
             } => {
                 // We must be specific about the opcodes above because other instructions are using
-                // the ExtractLane/InsertLane formats.
+                // the same formats.
                 let ty = self.func.dfg.value_type(arg);
                 if u16::from(lane) >= ty.lane_count() {
                     errors.fatal((

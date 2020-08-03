@@ -7,7 +7,8 @@ use wasmtime::*;
 use wasmtime_wasi::{Wasi, WasiCtx};
 
 fn main() -> Result<()> {
-    let store = Store::default();
+    let engine = Engine::default();
+    let store = Store::new(&engine);
 
     // First set up our linker which is going to be linking modules together. We
     // want our linker to have wasi available, so we set that up here as well.
@@ -16,8 +17,8 @@ fn main() -> Result<()> {
     wasi.add_to_linker(&mut linker)?;
 
     // Load and compile our two modules
-    let linking1 = Module::from_file(&store, "examples/linking1.wat")?;
-    let linking2 = Module::from_file(&store, "examples/linking2.wat")?;
+    let linking1 = Module::from_file(&engine, "examples/linking1.wat")?;
+    let linking2 = Module::from_file(&engine, "examples/linking2.wat")?;
 
     // Instantiate our first module which only uses WASI, then register that
     // instance with the linker since the next linking will use it.
@@ -26,7 +27,7 @@ fn main() -> Result<()> {
 
     // And with that we can perform the final link and the execute the module.
     let linking1 = linker.instantiate(&linking1)?;
-    let run = linking1.get_export("run").and_then(|e| e.func()).unwrap();
+    let run = linking1.get_func("run").unwrap();
     let run = run.get0::<()>()?;
     run()?;
     Ok(())

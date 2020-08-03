@@ -206,6 +206,11 @@ impl<'a> FunctionBuilder<'a> {
         }
     }
 
+    /// Get the block that this builder is currently at.
+    pub fn current_block(&self) -> Option<Block> {
+        self.position.expand()
+    }
+
     /// Set the source location that should be assigned to all new instructions.
     pub fn set_srcloc(&mut self, srcloc: ir::SourceLoc) {
         self.srcloc = srcloc;
@@ -221,6 +226,11 @@ impl<'a> FunctionBuilder<'a> {
             user_param_count: 0,
         };
         block
+    }
+
+    /// Insert `block` in the layout *after* the existing block `after`.
+    pub fn insert_block_after(&mut self, block: Block, after: Block) {
+        self.func.layout.insert_block_after(block, after);
     }
 
     /// After the call to this function, new instructions will be inserted into the designated
@@ -259,7 +269,7 @@ impl<'a> FunctionBuilder<'a> {
         self.handle_ssa_side_effects(side_effects);
     }
 
-    /// Effectively calls seal_block on all blocks in the function.
+    /// Effectively calls seal_block on all unsealed blocks in the function.
     ///
     /// It's more efficient to seal `Block`s as soon as possible, during
     /// translation, but for frontends where this is impractical to do, this
@@ -272,6 +282,12 @@ impl<'a> FunctionBuilder<'a> {
 
     /// In order to use a variable in a `use_var`, you need to declare its type with this method.
     pub fn declare_var(&mut self, var: Variable, ty: Type) {
+        debug_assert_eq!(
+            self.func_ctx.types[var],
+            types::INVALID,
+            "variable {:?} is declared twice",
+            var
+        );
         self.func_ctx.types[var] = ty;
     }
 
@@ -285,6 +301,12 @@ impl<'a> FunctionBuilder<'a> {
                     var
                 )
             });
+            debug_assert_ne!(
+                ty,
+                types::INVALID,
+                "variable {:?} is used but its type has not been declared",
+                var
+            );
             self.func_ctx
                 .ssa
                 .use_var(self.func, var, ty, self.position.unwrap())
@@ -1262,13 +1284,15 @@ block0:
         assert_eq!(
             func.display(None).to_string(),
             "function %sample() -> i8x16, b8x16, f32x4 system_v {
+    const0 = 0x00000000000000000000000000000000
+
 block0:
     v5 = f32const 0.0
     v6 = splat.f32x4 v5
     v2 -> v6
-    v4 = vconst.b8x16 0x00
+    v4 = vconst.b8x16 const0
     v1 -> v4
-    v3 = vconst.i8x16 0x00
+    v3 = vconst.i8x16 const0
     v0 -> v3
     return v0, v1, v2
 }

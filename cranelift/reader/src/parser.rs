@@ -15,14 +15,15 @@ use cranelift_codegen::ir::instructions::{InstructionData, InstructionFormat, Va
 use cranelift_codegen::ir::types::INVALID;
 use cranelift_codegen::ir::types::*;
 use cranelift_codegen::ir::{
-    AbiParam, ArgumentExtension, ArgumentLoc, Block, ConstantData, ExtFuncData, ExternalName,
-    FuncRef, Function, GlobalValue, GlobalValueData, Heap, HeapData, HeapStyle, JumpTable,
-    JumpTableData, MemFlags, Opcode, SigRef, Signature, StackSlot, StackSlotData, StackSlotKind,
-    Table, TableData, Type, Value, ValueLoc,
+    AbiParam, ArgumentExtension, ArgumentLoc, Block, Constant, ConstantData, ExtFuncData,
+    ExternalName, FuncRef, Function, GlobalValue, GlobalValueData, Heap, HeapData, HeapStyle,
+    JumpTable, JumpTableData, MemFlags, Opcode, SigRef, Signature, StackSlot, StackSlotData,
+    StackSlotKind, Table, TableData, Type, Value, ValueLoc,
 };
 use cranelift_codegen::isa::{self, CallConv, Encoding, RegUnit, TargetIsa};
 use cranelift_codegen::packed_option::ReservedValue;
 use cranelift_codegen::{settings, timing};
+use smallvec::SmallVec;
 use std::mem;
 use std::str::FromStr;
 use std::{u16, u32};
@@ -114,11 +115,25 @@ pub fn parse_test<'a>(text: &'a str, options: ParseOptions<'a>) -> ParseResult<T
     })
 }
 
-/// Parse the entire `text` as a run command.
-pub fn parse_run_command<'a>(text: &str, signature: &Signature) -> ParseResult<RunCommand> {
+/// Parse a CLIF comment `text` as a run command.
+///
+/// Return:
+///  - `Ok(None)` if the comment is not intended to be a `RunCommand` (i.e. does not start with `run`
+///    or `print`
+///  - `Ok(Some(command))` if the comment is intended as a `RunCommand` and can be parsed to one
+///  - `Err` otherwise.
+pub fn parse_run_command<'a>(text: &str, signature: &Signature) -> ParseResult<Option<RunCommand>> {
     let _tt = timing::parse_text();
-    let mut parser = Parser::new(text);
-    parser.parse_run_command(signature)
+    // We remove leading spaces and semi-colons for convenience here instead of at the call sites
+    // since this function will be attempting to parse a RunCommand from a CLIF comment.
+    let trimmed_text = text.trim_start_matches(|c| c == ' ' || c == ';');
+    let mut parser = Parser::new(trimmed_text);
+    match parser.token() {
+        Some(Token::Identifier("run")) | Some(Token::Identifier("print")) => {
+            parser.parse_run_command(signature).map(|c| Some(c))
+        }
+        Some(_) | None => Ok(None),
+    }
 }
 
 pub struct Parser<'a> {
@@ -346,6 +361,36 @@ impl<'a> Context<'a> {
         }
     }
 
+    // Allocate a new constant.
+    fn add_constant(
+        &mut self,
+        constant: Constant,
+        data: ConstantData,
+        loc: Location,
+    ) -> ParseResult<()> {
+        self.map.def_constant(constant, loc)?;
+        self.function.dfg.constants.set(constant, data);
+        Ok(())
+    }
+
+    // Configure the stack limit of the current function.
+    fn add_stack_limit(&mut self, limit: GlobalValue, loc: Location) -> ParseResult<()> {
+        if self.function.stack_limit.is_some() {
+            return err!(loc, "stack limit defined twice");
+        }
+        self.function.stack_limit = Some(limit);
+        Ok(())
+    }
+
+    // Resolve a reference to a constant.
+    fn check_constant(&self, c: Constant, loc: Location) -> ParseResult<()> {
+        if !self.map.contains_constant(c) {
+            err!(loc, "undefined constant {}", c)
+        } else {
+            Ok(())
+        }
+    }
+
     // Allocate a new block.
     fn add_block(&mut self, block: Block, loc: Location) -> ParseResult<Block> {
         self.map.def_block(block, loc)?;
@@ -566,6 +611,26 @@ impl<'a> Parser<'a> {
         err!(self.loc, "expected jump table number: jt«n»")
     }
 
+    // Match and consume a constant reference.
+    fn match_constant(&mut self) -> ParseResult<Constant> {
+        if let Some(Token::Constant(c)) = self.token() {
+            self.consume();
+            if let Some(c) = Constant::with_number(c) {
+                return Ok(c);
+            }
+        }
+        err!(self.loc, "expected constant number: const«n»")
+    }
+
+    // Match and consume a stack limit token
+    fn match_stack_limit(&mut self) -> ParseResult<()> {
+        if let Some(Token::Identifier("stack_limit")) = self.token() {
+            self.consume();
+            return Ok(());
+        }
+        err!(self.loc, "expected identifier: stack_limit")
+    }
+
     // Match and consume a block reference.
     fn match_block(&mut self, err_msg: &str) -> ParseResult<Block> {
         if let Some(Token::Block(block)) = self.token() {
@@ -621,8 +686,20 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Match and consume either a hexadecimal Uimm128 immediate (e.g. 0x000102...) or its literal list form (e.g. [0 1 2...])
-    fn match_constant_data(&mut self, controlling_type: Type) -> ParseResult<ConstantData> {
+    // Match and consume a sequence of immediate bytes (uimm8); e.g. [0x42 0x99 0x32]
+    fn match_constant_data(&mut self) -> ParseResult<ConstantData> {
+        self.match_token(Token::LBracket, "expected an opening left bracket")?;
+        let mut data = ConstantData::default();
+        while !self.optional(Token::RBracket) {
+            data = data.append(self.match_uimm8("expected a sequence of bytes (uimm8)")?);
+        }
+        Ok(data)
+    }
+
+    // Match and consume either a hexadecimal Uimm128 immediate (e.g. 0x000102...) or its literal
+    // list form (e.g. [0 1 2...]). For convenience, since uimm128 values are stored in the
+    // `ConstantPool`, this returns `ConstantData`.
+    fn match_uimm128(&mut self, controlling_type: Type) -> ParseResult<ConstantData> {
         let expected_size = controlling_type.bytes() as usize;
         let constant_data = if self.optional(Token::LBracket) {
             // parse using a list of values, e.g. vconst.i32x4 [0 1 2 3]
@@ -998,9 +1075,8 @@ impl<'a> Parser<'a> {
             if lane_size < 1 {
                 panic!("The boolean lane must have a byte size greater than zero.");
             }
-            let mut buffer = vec![0; lane_size as usize];
-            buffer[0] = if value { 1 } else { 0 };
-            buffer
+            let value = if value { 0xFF } else { 0 };
+            vec![value; lane_size as usize]
         }
 
         if !ty.is_vector() {
@@ -1102,7 +1178,8 @@ impl<'a> Parser<'a> {
                         self.consume_line().trim().split_whitespace(),
                         &mut flag_builder,
                         self.loc,
-                    )?;
+                    )
+                    .map_err(|err| ParseError::from(err))?;
                 }
                 "target" => {
                     let loc = self.loc;
@@ -1411,6 +1488,7 @@ impl<'a> Parser<'a> {
     //                   * function-decl
     //                   * signature-decl
     //                   * jump-table-decl
+    //                   * stack-limit-decl
     //
     // The parsed decls are added to `ctx` rather than returned.
     fn parse_preamble(&mut self, ctx: &mut Context) -> ParseResult<()> {
@@ -1453,6 +1531,16 @@ impl<'a> Parser<'a> {
                     self.start_gathering_comments();
                     self.parse_jump_table_decl()
                         .and_then(|(jt, dat)| ctx.add_jt(jt, dat, self.loc))
+                }
+                Some(Token::Constant(..)) => {
+                    self.start_gathering_comments();
+                    self.parse_constant_decl()
+                        .and_then(|(c, v)| ctx.add_constant(c, v, self.loc))
+                }
+                Some(Token::Identifier("stack_limit")) => {
+                    self.start_gathering_comments();
+                    self.parse_stack_limit_decl()
+                        .and_then(|gv| ctx.add_stack_limit(gv, self.loc))
                 }
                 // More to come..
                 _ => return Ok(()),
@@ -1838,6 +1926,48 @@ impl<'a> Parser<'a> {
         Ok((jt, data))
     }
 
+    // Parse a constant decl.
+    //
+    // constant-decl ::= * Constant(c) "=" ty? "[" literal {"," literal} "]"
+    fn parse_constant_decl(&mut self) -> ParseResult<(Constant, ConstantData)> {
+        let name = self.match_constant()?;
+        self.match_token(Token::Equal, "expected '=' in constant decl")?;
+        let data = if let Some(Token::Type(_)) = self.token() {
+            let ty = self.match_type("expected type of constant")?;
+            self.match_uimm128(ty)
+        } else {
+            self.match_constant_data()
+        }?;
+
+        // Collect any trailing comments.
+        self.token();
+        self.claim_gathered_comments(name);
+
+        Ok((name, data))
+    }
+
+    // Parse a stack limit decl
+    //
+    // stack-limit-decl ::= * StackLimit "=" GlobalValue(gv)
+    fn parse_stack_limit_decl(&mut self) -> ParseResult<GlobalValue> {
+        self.match_stack_limit()?;
+        self.match_token(Token::Equal, "expected '=' in stack limit decl")?;
+        let limit = match self.token() {
+            Some(Token::GlobalValue(base_num)) => match GlobalValue::with_number(base_num) {
+                Some(gv) => gv,
+                None => return err!(self.loc, "invalid global value number for stack limit"),
+            },
+            _ => return err!(self.loc, "expected global value"),
+        };
+        self.consume();
+
+        // Collect any trailing comments.
+        self.token();
+        self.claim_gathered_comments(AnyEntity::StackLimit);
+
+        Ok(limit)
+    }
+
     // Parse a function body, add contents to `ctx`.
     //
     // function-body ::= * { extended-basic-block }
@@ -2093,9 +2223,9 @@ impl<'a> Parser<'a> {
     //
     // inst-results ::= Value(v) { "," Value(v) }
     //
-    fn parse_inst_results(&mut self) -> ParseResult<Vec<Value>> {
+    fn parse_inst_results(&mut self) -> ParseResult<SmallVec<[Value; 1]>> {
         // Result value numbers.
-        let mut results = Vec::new();
+        let mut results = SmallVec::new();
 
         // instruction  ::=  * [inst-results "="] Opcode(opc) ["." Type] ...
         // inst-results ::= * Value(v) { "," Value(v) }
@@ -2537,7 +2667,7 @@ impl<'a> Parser<'a> {
             F32 => DataValue::from(f32::from_bits(self.match_ieee32("expected an f32")?.bits())),
             F64 => DataValue::from(f64::from_bits(self.match_ieee64("expected an f64")?.bits())),
             _ if ty.is_vector() => {
-                let as_vec = self.match_constant_data(ty)?.into_vec();
+                let as_vec = self.match_uimm128(ty)?.into_vec();
                 if as_vec.len() == 16 {
                     let mut as_array = [0; 16];
                     as_array.copy_from_slice(&as_vec[..16]);
@@ -2583,6 +2713,28 @@ impl<'a> Parser<'a> {
                 opcode,
                 imm: self.match_bool("expected immediate boolean operand")?,
             },
+            InstructionFormat::UnaryConst => {
+                let constant_handle = if let Some(Token::Constant(_)) = self.token() {
+                    // If handed a `const?`, use that.
+                    let c = self.match_constant()?;
+                    ctx.check_constant(c, self.loc)?;
+                    c
+                } else if let Some(controlling_type) = explicit_control_type {
+                    // If an explicit control type is present, we expect a sized value and insert
+                    // it in the constant pool.
+                    let uimm128 = self.match_uimm128(controlling_type)?;
+                    ctx.function.dfg.constants.insert(uimm128)
+                } else {
+                    return err!(
+                        self.loc,
+                        "Expected either a const entity or a typed value, e.g. inst.i32x4 [...]"
+                    );
+                };
+                InstructionData::UnaryConst {
+                    opcode,
+                    constant_handle,
+                }
+            }
             InstructionFormat::UnaryGlobalValue => {
                 let gv = self.match_gv("expected global value")?;
                 ctx.check_gv(gv, self.loc)?;
@@ -2600,11 +2752,17 @@ impl<'a> Parser<'a> {
                     args: [lhs, rhs],
                 }
             }
-            InstructionFormat::BinaryImm => {
+            InstructionFormat::BinaryImm8 => {
+                let arg = self.match_value("expected SSA value first operand")?;
+                self.match_token(Token::Comma, "expected ',' between operands")?;
+                let imm = self.match_uimm8("expected unsigned 8-bit immediate")?;
+                InstructionData::BinaryImm8 { opcode, arg, imm }
+            }
+            InstructionFormat::BinaryImm64 => {
                 let lhs = self.match_value("expected SSA value first operand")?;
                 self.match_token(Token::Comma, "expected ',' between operands")?;
                 let rhs = self.match_imm64("expected immediate integer second operand")?;
-                InstructionData::BinaryImm {
+                InstructionData::BinaryImm64 {
                     opcode,
                     arg: lhs,
                     imm: rhs,
@@ -2735,47 +2893,24 @@ impl<'a> Parser<'a> {
                 ctx.check_jt(table, self.loc)?;
                 InstructionData::IndirectJump { opcode, arg, table }
             }
-            InstructionFormat::InsertLane => {
+            InstructionFormat::TernaryImm8 => {
                 let lhs = self.match_value("expected SSA value first operand")?;
                 self.match_token(Token::Comma, "expected ',' between operands")?;
-                let lane = self.match_uimm8("expected lane number")?;
-                self.match_token(Token::Comma, "expected ',' between operands")?;
                 let rhs = self.match_value("expected SSA value last operand")?;
-                InstructionData::InsertLane {
+                self.match_token(Token::Comma, "expected ',' between operands")?;
+                let imm = self.match_uimm8("expected 8-bit immediate")?;
+                InstructionData::TernaryImm8 {
                     opcode,
-                    lane,
+                    imm,
                     args: [lhs, rhs],
                 }
             }
-            InstructionFormat::ExtractLane => {
-                let arg = self.match_value("expected SSA value last operand")?;
-                self.match_token(Token::Comma, "expected ',' between operands")?;
-                let lane = self.match_uimm8("expected lane number")?;
-                InstructionData::ExtractLane { opcode, lane, arg }
-            }
-            InstructionFormat::UnaryConst => match explicit_control_type {
-                None => {
-                    return err!(
-                        self.loc,
-                        "Expected {:?} to have a controlling type variable, e.g. inst.i32x4",
-                        opcode
-                    )
-                }
-                Some(controlling_type) => {
-                    let uimm128 = self.match_constant_data(controlling_type)?;
-                    let constant_handle = ctx.function.dfg.constants.insert(uimm128);
-                    InstructionData::UnaryConst {
-                        opcode,
-                        constant_handle,
-                    }
-                }
-            },
             InstructionFormat::Shuffle => {
                 let a = self.match_value("expected SSA value first operand")?;
                 self.match_token(Token::Comma, "expected ',' between operands")?;
                 let b = self.match_value("expected SSA value second operand")?;
                 self.match_token(Token::Comma, "expected ',' between operands")?;
-                let uimm128 = self.match_constant_data(I8X16)?;
+                let uimm128 = self.match_uimm128(I8X16)?;
                 let mask = ctx.function.dfg.immediates.push(uimm128);
                 InstructionData::Shuffle {
                     opcode,
@@ -3688,8 +3823,20 @@ mod tests {
             .unwrap();
         assert_eq!(
             c.into_vec(),
-            [1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+            [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]
         )
+    }
+
+    #[test]
+    fn parse_unbounded_constants() {
+        // Unlike match_uimm128, match_constant_data can parse byte sequences of any size:
+        assert_eq!(
+            Parser::new("[0 1]").match_constant_data().unwrap(),
+            vec![0, 1].into()
+        );
+
+        // Only parse byte literals:
+        assert!(Parser::new("[256]").match_constant_data().is_err());
     }
 
     #[test]
@@ -3760,7 +3907,7 @@ mod tests {
         assert_eq!(parse("false", B64).to_string(), "false");
         assert_eq!(
             parse("[0 1 2 3]", I32X4).to_string(),
-            "0x03000000020000000100000000"
+            "0x00000003000000020000000100000000"
         );
     }
 }

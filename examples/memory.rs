@@ -13,27 +13,23 @@ fn main() -> Result<()> {
     // Create our `Store` context and then compile a module and create an
     // instance from the compiled module all in one go.
     let wasmtime_store = Store::default();
-    let module = Module::from_file(&wasmtime_store, "examples/memory.wat")?;
-    let instance = Instance::new(&module, &[])?;
+    let module = Module::from_file(wasmtime_store.engine(), "examples/memory.wat")?;
+    let instance = Instance::new(&wasmtime_store, &module, &[])?;
 
     // Load up our exports from the instance
     let memory = instance
-        .get_export("memory")
-        .and_then(|e| e.memory())
+        .get_memory("memory")
         .ok_or(anyhow::format_err!("failed to find `memory` export"))?;
     let size = instance
-        .get_export("size")
-        .and_then(|e| e.func())
+        .get_func("size")
         .ok_or(anyhow::format_err!("failed to find `size` export"))?
         .get0::<i32>()?;
     let load = instance
-        .get_export("load")
-        .and_then(|e| e.func())
+        .get_func("load")
         .ok_or(anyhow::format_err!("failed to find `load` export"))?
         .get1::<i32, i32>()?;
     let store = instance
-        .get_export("store")
-        .and_then(|e| e.func())
+        .get_func("store")
         .ok_or(anyhow::format_err!("failed to find `store` export"))?
         .get2::<i32, i32, ()>()?;
 

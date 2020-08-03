@@ -11,7 +11,9 @@
 #[cfg(feature = "binaryen")]
 pub mod api;
 
-use arbitrary::Arbitrary;
+pub mod table_ops;
+
+use arbitrary::{Arbitrary, Unstructured};
 
 /// A Wasm test case generator that is powered by Binaryen's `wasm-opt -ttf`.
 #[derive(Clone)]
@@ -60,7 +62,7 @@ impl Arbitrary for WasmOptTtf {
 #[derive(Arbitrary, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DifferentialConfig {
     strategy: DifferentialStrategy,
-    opt_level: DifferentialOptLevel,
+    opt_level: OptLevel,
 }
 
 impl DifferentialConfig {
@@ -70,11 +72,7 @@ impl DifferentialConfig {
             DifferentialStrategy::Cranelift => wasmtime::Strategy::Cranelift,
             DifferentialStrategy::Lightbeam => wasmtime::Strategy::Lightbeam,
         })?;
-        config.cranelift_opt_level(match self.opt_level {
-            DifferentialOptLevel::None => wasmtime::OptLevel::None,
-            DifferentialOptLevel::Speed => wasmtime::OptLevel::Speed,
-            DifferentialOptLevel::SpeedAndSize => wasmtime::OptLevel::SpeedAndSize,
-        });
+        config.cranelift_opt_level(self.opt_level.to_wasmtime());
         Ok(config)
     }
 }
@@ -86,8 +84,73 @@ enum DifferentialStrategy {
 }
 
 #[derive(Arbitrary, Clone, Debug, PartialEq, Eq, Hash)]
-enum DifferentialOptLevel {
+enum OptLevel {
     None,
     Speed,
     SpeedAndSize,
+}
+
+impl OptLevel {
+    fn to_wasmtime(&self) -> wasmtime::OptLevel {
+        match self {
+            OptLevel::None => wasmtime::OptLevel::None,
+            OptLevel::Speed => wasmtime::OptLevel::Speed,
+            OptLevel::SpeedAndSize => wasmtime::OptLevel::SpeedAndSize,
+        }
+    }
+}
+
+/// Implementation of generating a `wasmtime::Config` arbitrarily
+#[derive(Arbitrary, Debug)]
+pub struct Config {
+    opt_level: OptLevel,
+    debug_info: bool,
+    canonicalize_nans: bool,
+    interruptable: bool,
+
+    // Note that we use 32-bit values here to avoid blowing the 64-bit address
+    // space by requesting ungodly-large sizes/guards.
+    static_memory_maximum_size: Option<u32>,
+    static_memory_guard_size: Option<u32>,
+    dynamic_memory_guard_size: Option<u32>,
+}
+
+impl Config {
+    /// Converts this to a `wasmtime::Config` object
+    pub fn to_wasmtime(&self) -> wasmtime::Config {
+        let mut cfg = wasmtime::Config::new();
+        cfg.debug_info(self.debug_info)
+            .static_memory_maximum_size(self.static_memory_maximum_size.unwrap_or(0).into())
+            .static_memory_guard_size(self.static_memory_guard_size.unwrap_or(0).into())
+            .dynamic_memory_guard_size(self.dynamic_memory_guard_size.unwrap_or(0).into())
+            .cranelift_nan_canonicalization(self.canonicalize_nans)
+            .cranelift_opt_level(self.opt_level.to_wasmtime())
+            .interruptable(self.interruptable);
+        return cfg;
+    }
+}
+
+include!(concat!(env!("OUT_DIR"), "/spectests.rs"));
+
+/// A spec test from the upstream wast testsuite, arbitrarily chosen from the
+/// list of known spec tests.
+#[derive(Debug)]
+pub struct SpecTest {
+    /// The filename of the spec test
+    pub file: &'static str,
+    /// The `*.wast` contents of the spec test
+    pub contents: &'static str,
+}
+
+impl Arbitrary for SpecTest {
+    fn arbitrary(u: &mut Unstructured) -> arbitrary::Result<Self> {
+        // NB: this does get a uniform value in the provided range.
+        let i = u.int_in_range(0..=FILES.len() - 1)?;
+        let (file, contents) = FILES[i];
+        Ok(SpecTest { file, contents })
+    }
+
+    fn size_hint(_depth: usize) -> (usize, Option<usize>) {
+        (1, Some(std::mem::size_of::<usize>()))
+    }
 }

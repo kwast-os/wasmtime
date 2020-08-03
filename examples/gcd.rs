@@ -11,13 +11,12 @@ fn main() -> Result<()> {
     // `Module` which is attached to a `Store` cache. After we've got that we
     // can instantiate it.
     let store = Store::default();
-    let module = Module::from_file(&store, "examples/gcd.wat")?;
-    let instance = Instance::new(&module, &[])?;
+    let module = Module::from_file(store.engine(), "examples/gcd.wat")?;
+    let instance = Instance::new(&store, &module, &[])?;
 
     // Invoke `gcd` export
     let gcd = instance
-        .get_export("gcd")
-        .and_then(|e| e.func())
+        .get_func("gcd")
         .ok_or(anyhow::format_err!("failed to find `gcd` function export"))?
         .get2::<i32, i32, i32>()?;
 

@@ -59,7 +59,7 @@ mod translation_utils;
 
 pub use crate::environ::{
     DummyEnvironment, FuncEnvironment, GlobalVariable, ModuleEnvironment, ReturnMode,
-    TargetEnvironment, WasmError, WasmResult,
+    TargetEnvironment, WasmError, WasmFuncType, WasmResult, WasmType,
 };
 pub use crate::func_translator::FuncTranslator;
 pub use crate::module_translator::translate_module;
@@ -70,6 +70,7 @@ pub use crate::translation_utils::{
     DefinedTableIndex, ElemIndex, FuncIndex, Global, GlobalIndex, GlobalInit, Memory, MemoryIndex,
     SignatureIndex, Table, TableElementType, TableIndex,
 };
+pub use cranelift_frontend::FunctionBuilder;
 
 /// Version number of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

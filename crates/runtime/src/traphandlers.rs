@@ -1,16 +1,14 @@
 //! WebAssembly trap handling, which is built on top of the lower-level
 //! signalhandling mechanisms.
 
-use crate::instance::{InstanceHandle, SignalHandler};
-use crate::trap_registry::TrapDescription;
-use crate::vmcontext::VMContext;
+use crate::VMContext;
 use backtrace::Backtrace;
 use std::any::Any;
 use std::cell::Cell;
 use std::error::Error;
-use std::fmt;
 use std::io;
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::Once;
 use wasmtime_environ::ir;
 
@@ -26,6 +24,9 @@ extern "C" {
 cfg_if::cfg_if! {
     if #[cfg(unix)] {
         use std::mem::{self, MaybeUninit};
+
+        /// Function which may handle custom signals while processing traps.
+        pub type SignalHandler<'a> = dyn Fn(libc::c_int, *const libc::siginfo_t, *const libc::c_void) -> bool + 'a;
 
         static mut PREV_SIGSEGV: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
         static mut PREV_SIGBUS: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
@@ -106,7 +107,6 @@ cfg_if::cfg_if! {
                 // out what to do based on the result of the trap handling.
                 let jmp_buf = info.handle_trap(
                     get_pc(context),
-                    false,
                     |handler| handler(signum, siginfo, context),
                 );
 
@@ -158,13 +158,15 @@ cfg_if::cfg_if! {
                 if #[cfg(all(target_os = "linux", target_arch = "x86_64"))] {
                     let cx = &*(cx as *const libc::ucontext_t);
                     cx.uc_mcontext.gregs[libc::REG_RIP as usize] as *const u8
+                } else if #[cfg(all(target_os = "linux", target_arch = "x86"))] {
+                    let cx = &*(cx as *const libc::ucontext_t);
+                    cx.uc_mcontext.gregs[libc::REG_EIP as usize] as *const u8
+                } else if #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))] {
+                    let cx = &*(cx as *const libc::ucontext_t);
+                    cx.uc_mcontext.pc as *const u8
                 } else if #[cfg(target_os = "macos")] {
-                    // FIXME(rust-lang/libc#1702) - once that lands and is
-                    // released we should inline the definition here
-                    extern "C" {
-                        fn GetPcFromUContext(cx: *mut libc::c_void) -> *const u8;
-                    }
-                    GetPcFromUContext(cx)
+                    let cx = &*(cx as *const libc::ucontext_t);
+                    (*cx.uc_mcontext).__ss.__rip as *const u8
                 } else {
                     compile_error!("unsupported platform");
                 }
@@ -175,6 +177,9 @@ cfg_if::cfg_if! {
         use winapi::um::winnt::*;
         use winapi::um::minwinbase::*;
         use winapi::vc::excpt::*;
+
+        /// Function which may handle custom signals while processing traps.
+        pub type SignalHandler<'a> = dyn Fn(winapi::um::winnt::PEXCEPTION_POINTERS) -> bool + 'a;
 
         unsafe fn platform_init() {
             // our trap handler needs to go first, so that we can recover from
@@ -194,7 +199,6 @@ cfg_if::cfg_if! {
             let record = &*(*exception_info).ExceptionRecord;
             if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION &&
                 record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION &&
-                record.ExceptionCode != EXCEPTION_STACK_OVERFLOW &&
                 record.ExceptionCode != EXCEPTION_INT_DIVIDE_BY_ZERO &&
                 record.ExceptionCode != EXCEPTION_INT_OVERFLOW
             {
@@ -220,11 +224,16 @@ cfg_if::cfg_if! {
                     Some(info) => info,
                     None => return EXCEPTION_CONTINUE_SEARCH,
                 };
-                let jmp_buf = info.handle_trap(
-                    (*(*exception_info).ContextRecord).Rip as *const u8,
-                    record.ExceptionCode == EXCEPTION_STACK_OVERFLOW,
-                    |handler| handler(exception_info),
-                );
+                cfg_if::cfg_if! {
+                    if #[cfg(target_arch = "x86_64")] {
+                        let ip = (*(*exception_info).ContextRecord).Rip as *const u8;
+                    } else if #[cfg(target_arch = "x86")] {
+                        let ip = (*(*exception_info).ContextRecord).Eip as *const u8;
+                    } else {
+                        compile_error!("unsupported platform");
+                    }
+                }
+                let jmp_buf = info.handle_trap(ip, |handler| handler(exception_info));
                 if jmp_buf.is_null() {
                     EXCEPTION_CONTINUE_SEARCH
                 } else if jmp_buf as usize == 1 {
@@ -246,7 +255,7 @@ cfg_if::cfg_if! {
 /// function needs to be called at the end of the startup process, after other
 /// handlers have been installed. This function can thus be called multiple
 /// times, having no effect after the first call.
-pub fn init() {
+pub fn init_traps() {
     static INIT: Once = Once::new();
     INIT.call_once(real_init);
 }
@@ -298,32 +307,28 @@ pub unsafe fn resume_panic(payload: Box<dyn Any + Send>) -> ! {
     tls::with(|info| info.unwrap().unwind_with(UnwindReason::Panic(payload)))
 }
 
-#[cfg(target_os = "windows")]
-fn reset_guard_page() {
-    extern "C" {
-        fn _resetstkoflw() -> winapi::ctypes::c_int;
-    }
-
-    // We need to restore guard page under stack to handle future stack overflows properly.
-    // https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/resetstkoflw?view=vs-2019
-    if unsafe { _resetstkoflw() } == 0 {
-        panic!("failed to restore stack guard page");
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn reset_guard_page() {}
-
 /// Stores trace message with backtrace.
 #[derive(Debug)]
 pub enum Trap {
     /// A user-raised trap through `raise_user_trap`.
     User(Box<dyn Error + Send + Sync>),
-    /// A wasm-originating trap from wasm code itself.
+
+    /// A trap raised from jit code
+    Jit {
+        /// The program counter in JIT code where this trap happened.
+        pc: usize,
+        /// Native stack backtrace at the time the trap occurred
+        backtrace: Backtrace,
+        /// An indicator for whether this may have been a trap generated from an
+        /// interrupt, used for switching what would otherwise be a stack
+        /// overflow trap to be an interrupt trap.
+        maybe_interrupted: bool,
+    },
+
+    /// A trap raised from a wasm libcall
     Wasm {
-        /// What sort of trap happened, as well as where in the original wasm module
-        /// it happened.
-        desc: TrapDescription,
+        /// Code of the trap.
+        trap_code: ir::TrapCode,
         /// Native stack backtrace at the time the trap occurred
         backtrace: Backtrace,
     },
@@ -335,36 +340,23 @@ pub enum Trap {
     },
 }
 
-impl fmt::Display for Trap {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Trap::User(user) => user.fmt(f),
-            Trap::Wasm { desc, .. } => desc.fmt(f),
-            Trap::OOM { .. } => write!(f, "Out of memory"),
-        }
-    }
-}
-
-impl std::error::Error for Trap {}
-
 impl Trap {
     /// Construct a new Wasm trap with the given source location and trap code.
     ///
     /// Internally saves a backtrace when constructed.
-    pub fn wasm(source_loc: ir::SourceLoc, trap_code: ir::TrapCode) -> Self {
-        let desc = TrapDescription {
-            source_loc,
+    pub fn wasm(trap_code: ir::TrapCode) -> Self {
+        let backtrace = Backtrace::new_unresolved();
+        Trap::Wasm {
             trap_code,
-        };
-        let backtrace = Backtrace::new();
-        Trap::Wasm { desc, backtrace }
+            backtrace,
+        }
     }
 
     /// Construct a new OOM trap with the given source location and trap code.
     ///
     /// Internally saves a backtrace when constructed.
     pub fn oom() -> Self {
-        let backtrace = Backtrace::new();
+        let backtrace = Backtrace::new_unresolved();
         Trap::OOM { backtrace }
     }
 }
@@ -373,7 +365,13 @@ impl Trap {
 /// returning them as a `Result`.
 ///
 /// Highly unsafe since `closure` won't have any dtors run.
-pub unsafe fn catch_traps<F>(vmctx: *mut VMContext, mut closure: F) -> Result<(), Trap>
+pub unsafe fn catch_traps<F>(
+    vmctx: *mut VMContext,
+    max_wasm_stack: usize,
+    is_wasm_code: impl Fn(usize) -> bool,
+    signal_handler: Option<&SignalHandler>,
+    mut closure: F,
+) -> Result<(), Trap>
 where
     F: FnMut(),
 {
@@ -381,7 +379,7 @@ where
     #[cfg(unix)]
     setup_unix_sigaltstack()?;
 
-    return CallThreadState::new(vmctx).with(|cx| {
+    return CallThreadState::new(vmctx, &is_wasm_code, signal_handler).with(max_wasm_stack, |cx| {
         RegisterSetjmp(
             cx.jmp_buf.as_ptr(),
             call_closure::<F>,
@@ -399,13 +397,13 @@ where
 
 /// Temporary state stored on the stack which is registered in the `tls` module
 /// below for calls into wasm.
-pub struct CallThreadState {
+pub struct CallThreadState<'a> {
     unwind: Cell<UnwindReason>,
     jmp_buf: Cell<*const u8>,
-    reset_guard_page: Cell<bool>,
-    prev: Option<*const CallThreadState>,
     vmctx: *mut VMContext,
     handling_trap: Cell<bool>,
+    is_wasm_code: &'a (dyn Fn(usize) -> bool + 'a),
+    signal_handler: Option<&'a SignalHandler<'a>>,
 }
 
 enum UnwindReason {
@@ -413,69 +411,140 @@ enum UnwindReason {
     Panic(Box<dyn Any + Send>),
     UserTrap(Box<dyn Error + Send + Sync>),
     LibTrap(Trap),
-    Trap { backtrace: Backtrace, pc: usize },
+    JitTrap { backtrace: Backtrace, pc: usize },
 }
 
-impl CallThreadState {
-    fn new(vmctx: *mut VMContext) -> CallThreadState {
+impl<'a> CallThreadState<'a> {
+    fn new(
+        vmctx: *mut VMContext,
+        is_wasm_code: &'a (dyn Fn(usize) -> bool + 'a),
+        signal_handler: Option<&'a SignalHandler<'a>>,
+    ) -> CallThreadState<'a> {
         CallThreadState {
             unwind: Cell::new(UnwindReason::None),
             vmctx,
             jmp_buf: Cell::new(ptr::null()),
-            reset_guard_page: Cell::new(false),
-            prev: None,
             handling_trap: Cell::new(false),
+            is_wasm_code,
+            signal_handler,
         }
     }
 
-    fn with(mut self, closure: impl FnOnce(&CallThreadState) -> i32) -> Result<(), Trap> {
-        tls::with(|prev| {
-            self.prev = prev.map(|p| p as *const _);
-            let ret = tls::set(&self, || closure(&self));
-            match self.unwind.replace(UnwindReason::None) {
-                UnwindReason::None => {
-                    debug_assert_eq!(ret, 1);
-                    Ok(())
-                }
-                UnwindReason::UserTrap(data) => {
-                    debug_assert_eq!(ret, 0);
-                    Err(Trap::User(data))
-                }
-                UnwindReason::LibTrap(trap) => Err(trap),
-                UnwindReason::Trap { backtrace, pc } => {
-                    debug_assert_eq!(ret, 0);
-                    let instance = unsafe { InstanceHandle::from_vmctx(self.vmctx) };
-
-                    Err(Trap::Wasm {
-                        desc: instance
-                            .instance()
-                            .trap_registration
-                            .get_trap(pc)
-                            .unwrap_or_else(|| TrapDescription {
-                                source_loc: ir::SourceLoc::default(),
-                                trap_code: ir::TrapCode::StackOverflow,
-                            }),
-                        backtrace,
-                    })
-                }
-                UnwindReason::Panic(panic) => {
-                    debug_assert_eq!(ret, 0);
-                    std::panic::resume_unwind(panic)
-                }
+    fn with(
+        self,
+        max_wasm_stack: usize,
+        closure: impl FnOnce(&CallThreadState) -> i32,
+    ) -> Result<(), Trap> {
+        let _reset = self.update_stack_limit(max_wasm_stack)?;
+        let ret = tls::set(&self, || closure(&self));
+        match self.unwind.replace(UnwindReason::None) {
+            UnwindReason::None => {
+                debug_assert_eq!(ret, 1);
+                Ok(())
             }
-        })
-    }
-
-    fn any_instance(&self, func: impl Fn(&InstanceHandle) -> bool) -> bool {
-        unsafe {
-            if func(&InstanceHandle::from_vmctx(self.vmctx)) {
-                return true;
+            UnwindReason::UserTrap(data) => {
+                debug_assert_eq!(ret, 0);
+                Err(Trap::User(data))
             }
-            match self.prev {
-                Some(prev) => (*prev).any_instance(func),
-                None => false,
+            UnwindReason::LibTrap(trap) => Err(trap),
+            UnwindReason::JitTrap { backtrace, pc } => {
+                debug_assert_eq!(ret, 0);
+                let maybe_interrupted = unsafe {
+                    (*self.vmctx).instance().interrupts.stack_limit.load(SeqCst)
+                        == wasmtime_environ::INTERRUPTED
+                };
+                Err(Trap::Jit {
+                    pc,
+                    backtrace,
+                    maybe_interrupted,
+                })
+            }
+            UnwindReason::Panic(panic) => {
+                debug_assert_eq!(ret, 0);
+                std::panic::resume_unwind(panic)
             }
         }
+    }
+
+    /// Checks and/or initializes the wasm native call stack limit.
+    ///
+    /// This function will inspect the current state of the stack and calling
+    /// context to determine which of three buckets we're in:
+    ///
+    /// 1. We are the first wasm call on the stack. This means that we need to
+    ///    set up a stack limit where beyond which if the native wasm stack
+    ///    pointer goes beyond forces a trap. For now we simply reserve an
+    ///    arbitrary chunk of bytes (1 MB from roughly the current native stack
+    ///    pointer). This logic will likely get tweaked over time.
+    ///
+    /// 2. We aren't the first wasm call on the stack. In this scenario the wasm
+    ///    stack limit is already configured. This case of wasm -> host -> wasm
+    ///    we assume that the native stack consumed by the host is accounted for
+    ///    in the initial stack limit calculation. That means that in this
+    ///    scenario we do nothing.
+    ///
+    /// 3. We were previously interrupted. In this case we consume the interrupt
+    ///    here and return a trap, clearing the interrupt and allowing the next
+    ///    wasm call to proceed.
+    ///
+    /// The return value here is a trap for case 3, a noop destructor in case 2,
+    /// and a meaningful destructor in case 1
+    ///
+    /// For more information about interrupts and stack limits see
+    /// `crates/environ/src/cranelift.rs`.
+    ///
+    /// Note that this function must be called with `self` on the stack, not the
+    /// heap/etc.
+    fn update_stack_limit(&self, max_wasm_stack: usize) -> Result<impl Drop + '_, Trap> {
+        // Make an "educated guess" to figure out where the wasm sp value should
+        // start trapping if it drops below.
+        let wasm_stack_limit = self as *const _ as usize - max_wasm_stack;
+
+        let interrupts = unsafe { &**(&*self.vmctx).instance().interrupts() };
+        let reset_stack_limit = match interrupts.stack_limit.compare_exchange(
+            usize::max_value(),
+            wasm_stack_limit,
+            SeqCst,
+            SeqCst,
+        ) {
+            Ok(_) => {
+                // We're the first wasm on the stack so we've now reserved the
+                // `max_wasm_stack` bytes of native stack space for wasm.
+                // Nothing left to do here now except reset back when we're
+                // done.
+                true
+            }
+            Err(n) if n == wasmtime_environ::INTERRUPTED => {
+                // This means that an interrupt happened before we actually
+                // called this function, which means that we're now
+                // considered interrupted. Be sure to consume this interrupt
+                // as part of this process too.
+                interrupts.stack_limit.store(usize::max_value(), SeqCst);
+                return Err(Trap::Wasm {
+                    trap_code: ir::TrapCode::Interrupt,
+                    backtrace: Backtrace::new_unresolved(),
+                });
+            }
+            Err(_) => {
+                // The stack limit was previously set by a previous wasm
+                // call on the stack. We leave the original stack limit for
+                // wasm in place in that case, and don't reset the stack
+                // limit when we're done.
+                false
+            }
+        };
+
+        struct Reset<'a>(bool, &'a AtomicUsize);
+
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                if self.0 {
+                    self.1.store(usize::max_value(), SeqCst);
+                }
+            }
+        }
+
+        Ok(Reset(reset_stack_limit, &interrupts.stack_limit))
     }
 
     fn unwind_with(&self, reason: UnwindReason) -> ! {
@@ -488,8 +557,6 @@ impl CallThreadState {
     /// Trap handler using our thread-local state.
     ///
     /// * `pc` - the program counter the trap happened at
-    /// * `reset_guard_page` - whether or not to reset the guard page,
-    ///   currently Windows specific
     /// * `call_handler` - a closure used to invoke the platform-specific
     ///   signal handler for each instance, if available.
     ///
@@ -505,7 +572,6 @@ impl CallThreadState {
     fn handle_trap(
         &self,
         pc: *const u8,
-        reset_guard_page: bool,
         call_handler: impl Fn(&SignalHandler) -> bool,
     ) -> *const u8 {
         // If we hit a fault while handling a previous trap, that's quite bad,
@@ -516,21 +582,25 @@ impl CallThreadState {
         if self.handling_trap.replace(true) {
             return ptr::null();
         }
+        let _reset = ResetCell(&self.handling_trap, false);
+
+        // If we haven't even started to handle traps yet, bail out.
+        if self.jmp_buf.get().is_null() {
+            return ptr::null();
+        }
 
         // First up see if any instance registered has a custom trap handler,
         // in which case run them all. If anything handles the trap then we
         // return that the trap was handled.
-        if self.any_instance(|i| {
-            let handler = match i.instance().signal_handler.replace(None) {
-                Some(handler) => handler,
-                None => return false,
-            };
-            let result = call_handler(&handler);
-            i.instance().signal_handler.set(Some(handler));
-            return result;
-        }) {
-            self.handling_trap.set(false);
-            return 1 as *const _;
+        if let Some(handler) = self.signal_handler {
+            if call_handler(handler) {
+                return 1 as *const _;
+            }
+        }
+
+        // If this fault wasn't in wasm code, then it's not our problem
+        if !(self.is_wasm_code)(pc as usize) {
+            return ptr::null();
         }
 
         // TODO: stack overflow can happen at any random time (i.e. in malloc()
@@ -541,25 +611,22 @@ impl CallThreadState {
         // doesn't trap. Then, if we have called some WebAssembly code, it
         // means the trap is stack overflow.
         if self.jmp_buf.get().is_null() {
-            self.handling_trap.set(false);
             return ptr::null();
         }
         let backtrace = Backtrace::new_unresolved();
-        self.reset_guard_page.set(reset_guard_page);
-        self.unwind.replace(UnwindReason::Trap {
+        self.unwind.replace(UnwindReason::JitTrap {
             backtrace,
             pc: pc as usize,
         });
-        self.handling_trap.set(false);
         self.jmp_buf.get()
     }
 }
 
-impl Drop for CallThreadState {
+struct ResetCell<'a, T: Copy>(&'a Cell<T>, T);
+
+impl<T: Copy> Drop for ResetCell<'_, T> {
     fn drop(&mut self) {
-        if self.reset_guard_page.get() {
-            reset_guard_page();
-        }
+        self.0.set(self.1);
     }
 }
 
@@ -571,14 +638,15 @@ impl Drop for CallThreadState {
 mod tls {
     use super::CallThreadState;
     use std::cell::Cell;
+    use std::mem;
     use std::ptr;
 
-    thread_local!(static PTR: Cell<*const CallThreadState> = Cell::new(ptr::null()));
+    thread_local!(static PTR: Cell<*const CallThreadState<'static>> = Cell::new(ptr::null()));
 
     /// Configures thread local state such that for the duration of the
     /// execution of `closure` any call to `with` will yield `ptr`, unless this
     /// is recursively called again.
-    pub fn set<R>(ptr: &CallThreadState, closure: impl FnOnce() -> R) -> R {
+    pub fn set<R>(ptr: &CallThreadState<'_>, closure: impl FnOnce() -> R) -> R {
         struct Reset<'a, T: Copy>(&'a Cell<T>, T);
 
         impl<T: Copy> Drop for Reset<'_, T> {
@@ -588,6 +656,12 @@ mod tls {
         }
 
         PTR.with(|p| {
+            // Note that this extension of the lifetime to `'static` should be
+            // safe because we only ever access it below with an anonymous
+            // lifetime, meaning `'static` never leaks out of this module.
+            let ptr = unsafe {
+                mem::transmute::<*const CallThreadState<'_>, *const CallThreadState<'static>>(ptr)
+            };
             let _r = Reset(p, p.replace(ptr));
             closure()
         })
@@ -595,7 +669,7 @@ mod tls {
 
     /// Returns the last pointer configured with `set` above. Panics if `set`
     /// has not been previously called.
-    pub fn with<R>(closure: impl FnOnce(Option<&CallThreadState>) -> R) -> R {
+    pub fn with<R>(closure: impl FnOnce(Option<&CallThreadState<'_>>) -> R) -> R {
         PTR.with(|ptr| {
             let p = ptr.get();
             unsafe { closure(if p.is_null() { None } else { Some(&*p) }) }

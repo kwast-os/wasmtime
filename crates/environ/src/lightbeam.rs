@@ -1,15 +1,16 @@
 //! Support for compiling with Lightbeam.
 
 use crate::cache::ModuleCacheDataTupleType;
-use crate::compilation::{Compilation, CompileError, Traps};
+use crate::compilation::{Compilation, CompileError};
 use crate::func_environ::FuncEnvironment;
+use crate::CacheConfig;
 use crate::ModuleTranslation;
 // TODO: Put this in `compilation`
 use crate::address_map::{ModuleAddressMap, ValueLabelsRanges};
-use crate::cranelift::RelocSink;
-use crate::CacheConfig;
+use crate::cranelift::{RelocSink, TrapSink};
 use cranelift_codegen::isa;
 use cranelift_entity::{PrimaryMap, SecondaryMap};
+use lightbeam::{CodeGenSession, NullOffsetSink, Sinks};
 
 /// A compiler that compiles a WebAssembly module with Lightbeam, directly translating the Wasm file.
 pub struct Lightbeam;
@@ -26,23 +27,40 @@ impl crate::compilation::Compiler for Lightbeam {
             return Err(CompileError::DebugInfoNotSupported);
         }
 
-        let env = FuncEnvironment::new(isa.frontend_config(), &translation.module.local);
-        let mut relocations = PrimaryMap::new();
-        let mut codegen_session: lightbeam::CodeGenSession<_> =
-            lightbeam::CodeGenSession::new(translation.function_body_inputs.len() as u32, &env);
+        let env = FuncEnvironment::new(
+            isa.frontend_config(),
+            &translation.module.local,
+            &translation.tunables,
+        );
+        let mut relocations = PrimaryMap::with_capacity(translation.function_body_inputs.len());
+        let mut traps = PrimaryMap::with_capacity(translation.function_body_inputs.len());
+        let stack_maps = PrimaryMap::with_capacity(translation.function_body_inputs.len());
+
+        let mut codegen_session: CodeGenSession<_> = CodeGenSession::new(
+            translation.function_body_inputs.len() as u32,
+            &env,
+            lightbeam::microwasm::I32,
+        );
 
         for (i, function_body) in &translation.function_body_inputs {
             let func_index = translation.module.local.func_index(i);
-            let mut reloc_sink = RelocSink::new(func_index);
 
+            let mut reloc_sink = RelocSink::new(func_index);
+            let mut trap_sink = TrapSink::new();
             lightbeam::translate_function(
                 &mut codegen_session,
-                &mut reloc_sink,
+                Sinks {
+                    relocs: &mut reloc_sink,
+                    traps: &mut trap_sink,
+                    offsets: &mut NullOffsetSink,
+                },
                 i.as_u32(),
-                &wasmparser::FunctionBody::new(0, function_body.data),
+                wasmparser::FunctionBody::new(0, function_body.data),
             )
             .map_err(|e| CompileError::Codegen(format!("Failed to translate function: {}", e)))?;
+
             relocations.push(reloc_sink.func_relocs);
+            traps.push(trap_sink.traps);
         }
 
         let code_section = codegen_session
@@ -55,7 +73,7 @@ impl crate::compilation::Compiler for Lightbeam {
         let code_section_ranges_and_jt = code_section
             .funcs()
             .into_iter()
-            .map(|r| (r, SecondaryMap::new(), 0..0));
+            .map(|r| (r, SecondaryMap::new()));
 
         Ok((
             Compilation::from_buffer(code_section.buffer().to_vec(), code_section_ranges_and_jt),
@@ -63,8 +81,8 @@ impl crate::compilation::Compiler for Lightbeam {
             ModuleAddressMap::new(),
             ValueLabelsRanges::new(),
             PrimaryMap::new(),
-            Traps::new(),
-            PrimaryMap::new(),
+            traps,
+            stack_maps,
         ))
     }
 }

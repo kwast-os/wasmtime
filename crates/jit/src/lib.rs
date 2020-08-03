@@ -23,18 +23,19 @@
 
 mod code_memory;
 mod compiler;
-mod function_table;
 mod imports;
 mod instantiate;
 mod link;
+mod object;
 mod resolver;
+mod unwind;
 
 pub mod native;
 pub mod trampoline;
 
 pub use crate::code_memory::CodeMemory;
-pub use crate::compiler::{make_trampoline, Compilation, CompilationStrategy, Compiler};
-pub use crate::instantiate::{instantiate, CompiledModule, SetupError};
+pub use crate::compiler::{Compilation, CompilationStrategy, Compiler};
+pub use crate::instantiate::{CompiledModule, SetupError};
 pub use crate::link::link_module;
 pub use crate::resolver::{NullResolver, Resolver};
 

@@ -6,15 +6,18 @@
 //! which is our WASI implementation, [wasi-common].
 //!
 //! [nix]: https://github.com/nix-rust/nix
-//! [wasi-common]: https://github.com/bytecodealliance/wasmtime/tree/master/crates/wasi-common
-#![cfg(unix)]
+//! [wasi-common]: https://github.com/bytecodealliance/wasmtime/tree/main/crates/wasi-common
+#![cfg(any(unix, target_os = "wasi"))]
 
+#[cfg(not(target_os = "wasi"))] // not implemented for WASI in yanix yet
 pub mod clock;
 pub mod dir;
 pub mod fcntl;
 pub mod file;
 pub mod filetime;
+#[cfg(not(target_os = "wasi"))] // not implemented for WASI in yanix yet
 pub mod poll;
+#[cfg(not(target_os = "wasi"))] // not supported in WASI yet
 pub mod socket;
 
 mod sys;

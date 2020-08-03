@@ -3,80 +3,46 @@
 //! `InstanceHandle` is a reference-counting handle for an `Instance`.
 
 use crate::export::Export;
+use crate::externref::{StackMapRegistry, VMExternRefActivationsTable};
 use crate::imports::Imports;
-use crate::jit_int::GdbJitImageRegistration;
 use crate::memory::{DefaultMemoryCreator, RuntimeLinearMemory, RuntimeMemoryCreator};
-use crate::table::Table;
-use crate::traphandlers;
-use crate::traphandlers::{catch_traps, Trap};
+use crate::table::{Table, TableElement};
+use crate::traphandlers::Trap;
 use crate::vmcontext::{
     VMBuiltinFunctionsArray, VMCallerCheckedAnyfunc, VMContext, VMFunctionBody, VMFunctionImport,
-    VMGlobalDefinition, VMGlobalImport, VMMemoryDefinition, VMMemoryImport, VMSharedSignatureIndex,
-    VMTableDefinition, VMTableImport, VMTrampoline,
+    VMGlobalDefinition, VMGlobalImport, VMInterrupts, VMMemoryDefinition, VMMemoryImport,
+    VMSharedSignatureIndex, VMTableDefinition, VMTableImport, VMTrampoline,
 };
-use crate::TrapRegistration;
 use crate::{ExportFunction, ExportGlobal, ExportMemory, ExportTable};
 use memoffset::offset_of;
 use more_asserts::assert_lt;
 use std::alloc::{self, Layout};
 use std::any::Any;
-use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::rc::Rc;
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::{mem, ptr, slice};
 use thiserror::Error;
 use wasmtime_environ::entity::{packed_option::ReservedValue, BoxedSlice, EntityRef, PrimaryMap};
 use wasmtime_environ::wasm::{
     DataIndex, DefinedFuncIndex, DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex,
-    ElemIndex, FuncIndex, GlobalIndex, GlobalInit, MemoryIndex, SignatureIndex, TableIndex,
+    ElemIndex, FuncIndex, GlobalIndex, GlobalInit, MemoryIndex, SignatureIndex, TableElementType,
+    TableIndex, WasmType,
 };
-use wasmtime_environ::{ir, DataInitializer, Module, TableElements, VMOffsets};
-
-cfg_if::cfg_if! {
-    if #[cfg(unix)] {
-        pub type SignalHandler = dyn Fn(libc::c_int, *const libc::siginfo_t, *const libc::c_void) -> bool;
-
-        impl InstanceHandle {
-            /// Set a custom signal handler
-            pub fn set_signal_handler<H>(&mut self, handler: H)
-            where
-                H: 'static + Fn(libc::c_int, *const libc::siginfo_t, *const libc::c_void) -> bool,
-            {
-                self.instance().signal_handler.set(Some(Box::new(handler)));
-            }
-        }
-    } else if #[cfg(target_os = "windows")] {
-        pub type SignalHandler = dyn Fn(winapi::um::winnt::PEXCEPTION_POINTERS) -> bool;
-
-        impl InstanceHandle {
-            /// Set a custom signal handler
-            pub fn set_signal_handler<H>(&mut self, handler: H)
-            where
-                H: 'static + Fn(winapi::um::winnt::PEXCEPTION_POINTERS) -> bool,
-            {
-                self.instance().signal_handler.set(Some(Box::new(handler)));
-            }
-        }
-    }
-}
+use wasmtime_environ::{ir, DataInitializer, EntityIndex, Module, TableElements, VMOffsets};
 
 /// A WebAssembly instance.
 ///
 /// This is repr(C) to ensure that the vmctx field is last.
 #[repr(C)]
 pub(crate) struct Instance {
-    /// The number of references to this `Instance`.
-    refcount: Cell<usize>,
-
-    /// `Instance`s from which this `Instance` imports. These won't
-    /// create reference cycles because wasm instances can't cyclically
-    /// import from each other.
-    dependencies: HashSet<InstanceHandle>,
-
     /// The `Module` this `Instance` was instantiated from.
     module: Arc<Module>,
+
+    /// The module's JIT code (if exists).
+    code: Arc<dyn Any>,
 
     /// Offsets in the `vmctx` region.
     offsets: VMOffsets,
@@ -90,7 +56,7 @@ pub(crate) struct Instance {
     /// Passive elements in this instantiation. As `elem.drop`s happen, these
     /// entries get removed. A missing entry is considered equivalent to an
     /// empty slice.
-    passive_elements: RefCell<HashMap<ElemIndex, Box<[VMCallerCheckedAnyfunc]>>>,
+    passive_elements: RefCell<HashMap<ElemIndex, Box<[*mut VMCallerCheckedAnyfunc]>>>,
 
     /// Passive data segments from our module. As `data.drop`s happen, entries
     /// get removed. A missing entry is considered equivalent to an empty slice.
@@ -105,15 +71,9 @@ pub(crate) struct Instance {
     /// Hosts can store arbitrary per-instance information here.
     host_state: Box<dyn Any>,
 
-    /// Optional image of JIT'ed code for debugger registration.
-    dbg_jit_registration: Option<Rc<GdbJitImageRegistration>>,
-
-    /// Handler run when `SIGBUS`, `SIGFPE`, `SIGILL`, or `SIGSEGV` are caught by the instance thread.
-    pub(crate) signal_handler: Cell<Option<Box<SignalHandler>>>,
-
-    /// Handle to our registration of traps so signals know what trap to return
-    /// when a segfault/sigill happens.
-    pub(crate) trap_registration: TrapRegistration,
+    /// Externally allocated data indicating how this instance will be
+    /// interrupted.
+    pub(crate) interrupts: Arc<VMInterrupts>,
 
     /// Additional context used by compiled wasm code. This field is last, and
     /// represents a dynamically-sized array that extends beyond the nominal
@@ -137,12 +97,8 @@ impl Instance {
         unsafe { *self.signature_ids_ptr().add(index) }
     }
 
-    pub(crate) fn module(&self) -> &Arc<Module> {
+    pub(crate) fn module(&self) -> &Module {
         &self.module
-    }
-
-    pub(crate) fn module_ref(&self) -> &Module {
-        &*self.module
     }
 
     /// Return a pointer to the `VMSharedSignatureIndex`s.
@@ -270,6 +226,21 @@ impl Instance {
         unsafe { self.globals_ptr().add(index) }
     }
 
+    /// Get a raw pointer to the global at the given index regardless whether it
+    /// is defined locally or imported from another module.
+    ///
+    /// Panics if the index is out of bound or is the reserved value.
+    pub(crate) fn defined_or_imported_global_ptr(
+        &self,
+        index: GlobalIndex,
+    ) -> *mut VMGlobalDefinition {
+        if let Some(index) = self.module.local.defined_global_index(index) {
+            self.global_ptr(index)
+        } else {
+            self.imported_global(index).from
+        }
+    }
+
     /// Return a pointer to the `VMGlobalDefinition`s.
     fn globals_ptr(&self) -> *mut VMGlobalDefinition {
         unsafe { self.vmctx_plus_offset(self.offsets.vmctx_globals_begin()) }
@@ -278,6 +249,21 @@ impl Instance {
     /// Return a pointer to the `VMBuiltinFunctionsArray`.
     fn builtin_functions_ptr(&self) -> *mut VMBuiltinFunctionsArray {
         unsafe { self.vmctx_plus_offset(self.offsets.vmctx_builtin_functions_begin()) }
+    }
+
+    /// Return a pointer to the interrupts structure
+    pub fn interrupts(&self) -> *mut *const VMInterrupts {
+        unsafe { self.vmctx_plus_offset(self.offsets.vmctx_interrupts()) }
+    }
+
+    /// Return a pointer to the `VMExternRefActivationsTable`.
+    pub fn externref_activations_table(&self) -> *mut *mut VMExternRefActivationsTable {
+        unsafe { self.vmctx_plus_offset(self.offsets.vmctx_externref_activations_table()) }
+    }
+
+    /// Return a pointer to the `StackMapRegistry`.
+    pub fn stack_map_registry(&self) -> *mut *mut StackMapRegistry {
+        unsafe { self.vmctx_plus_offset(self.offsets.vmctx_stack_map_registry()) }
     }
 
     /// Return a reference to the vmctx used by compiled wasm code.
@@ -301,28 +287,15 @@ impl Instance {
     }
 
     /// Lookup an export with the given export declaration.
-    pub fn lookup_by_declaration(&self, export: &wasmtime_environ::Export) -> Export {
+    pub fn lookup_by_declaration(&self, export: &EntityIndex) -> Export {
         match export {
-            wasmtime_environ::Export::Function(index) => {
-                let signature = self.signature_id(self.module.local.functions[*index]);
-                let (address, vmctx) =
-                    if let Some(def_index) = self.module.local.defined_func_index(*index) {
-                        (
-                            self.finished_functions[def_index] as *const _,
-                            self.vmctx_ptr(),
-                        )
-                    } else {
-                        let import = self.imported_function(*index);
-                        (import.body, import.vmctx)
-                    };
-                ExportFunction {
-                    address,
-                    signature,
-                    vmctx,
-                }
-                .into()
+            EntityIndex::Function(index) => {
+                let anyfunc = self.get_caller_checked_anyfunc(*index).unwrap();
+                let anyfunc =
+                    NonNull::new(anyfunc as *const VMCallerCheckedAnyfunc as *mut _).unwrap();
+                ExportFunction { anyfunc }.into()
             }
-            wasmtime_environ::Export::Table(index) => {
+            EntityIndex::Table(index) => {
                 let (definition, vmctx) =
                     if let Some(def_index) = self.module.local.defined_table_index(*index) {
                         (self.table_ptr(def_index), self.vmctx_ptr())
@@ -337,7 +310,7 @@ impl Instance {
                 }
                 .into()
             }
-            wasmtime_environ::Export::Memory(index) => {
+            EntityIndex::Memory(index) => {
                 let (definition, vmctx) =
                     if let Some(def_index) = self.module.local.defined_memory_index(*index) {
                         (self.memory_ptr(def_index), self.vmctx_ptr())
@@ -352,7 +325,7 @@ impl Instance {
                 }
                 .into()
             }
-            wasmtime_environ::Export::Global(index) => ExportGlobal {
+            EntityIndex::Global(index) => ExportGlobal {
                 definition: if let Some(def_index) = self.module.local.defined_global_index(*index)
                 {
                     self.global_ptr(def_index)
@@ -368,54 +341,21 @@ impl Instance {
 
     /// Return an iterator over the exports of this instance.
     ///
-    /// Specifically, it provides access to the key-value pairs, where they keys
+    /// Specifically, it provides access to the key-value pairs, where the keys
     /// are export names, and the values are export declarations which can be
     /// resolved `lookup_by_declaration`.
-    pub fn exports(&self) -> indexmap::map::Iter<String, wasmtime_environ::Export> {
+    pub fn exports(&self) -> indexmap::map::Iter<String, EntityIndex> {
         self.module.exports.iter()
     }
 
     /// Return a reference to the custom state attached to this instance.
+    #[inline]
     pub fn host_state(&self) -> &dyn Any {
         &*self.host_state
     }
 
-    /// Invoke the WebAssembly start function of the instance, if one is present.
-    fn invoke_start_function(&self) -> Result<(), InstantiationError> {
-        let start_index = match self.module.start_func {
-            Some(idx) => idx,
-            None => return Ok(()),
-        };
-
-        let (callee_address, callee_vmctx) = match self.module.local.defined_func_index(start_index)
-        {
-            Some(defined_index) => {
-                let body = *self
-                    .finished_functions
-                    .get(defined_index)
-                    .expect("function index is out of bounds");
-                (body as *const _, self.vmctx_ptr())
-            }
-            None => {
-                assert_lt!(start_index.index(), self.module.imported_funcs.len());
-                let import = self.imported_function(start_index);
-                (import.body, import.vmctx)
-            }
-        };
-
-        // Make the call.
-        unsafe {
-            catch_traps(callee_vmctx, || {
-                mem::transmute::<
-                    *const VMFunctionBody,
-                    unsafe extern "C" fn(*mut VMContext, *mut VMContext),
-                >(callee_address)(callee_vmctx, self.vmctx_ptr())
-            })
-            .map_err(InstantiationError::StartTrap)
-        }
-    }
-
     /// Return the offset from the vmctx pointer to its containing Instance.
+    #[inline]
     pub(crate) fn vmctx_offset() -> isize {
         offset_of!(Self, vmctx) as isize
     }
@@ -512,29 +452,60 @@ impl Instance {
         foreign_instance.memory_size(foreign_index)
     }
 
-    /// Grow table by the specified amount of elements.
+    pub(crate) fn table_element_type(&self, table_index: TableIndex) -> TableElementType {
+        let table = self.get_table(table_index);
+        table.element_type()
+    }
+
+    /// Grow table by the specified amount of elements, filling them with
+    /// `init_value`.
     ///
-    /// Returns `None` if table can't be grown by the specified amount
-    /// of elements.
-    pub(crate) fn table_grow(&self, table_index: DefinedTableIndex, delta: u32) -> Option<u32> {
-        let result = self
-            .tables
-            .get(table_index)
-            .unwrap_or_else(|| panic!("no table for index {}", table_index.index()))
-            .grow(delta);
+    /// Returns `None` if table can't be grown by the specified amount of
+    /// elements, or if `init_value` is the wrong type of table element.
+    pub(crate) fn table_grow(
+        &self,
+        table_index: TableIndex,
+        delta: u32,
+        init_value: TableElement,
+    ) -> Option<u32> {
+        let (defined_table_index, instance) =
+            self.get_defined_table_index_and_instance(table_index);
+        instance.defined_table_grow(defined_table_index, delta, init_value)
+    }
 
-        // Keep current the VMContext pointers used by compiled wasm code.
-        self.set_table(table_index, self.tables[table_index].vmtable());
+    fn defined_table_grow(
+        &self,
+        table_index: DefinedTableIndex,
+        delta: u32,
+        init_value: TableElement,
+    ) -> Option<u32> {
+        unsafe {
+            let orig_size = self
+                .tables
+                .get(table_index)
+                .unwrap_or_else(|| panic!("no table for index {}", table_index.index()))
+                .grow(delta, init_value)?;
 
-        result
+            // Keep the `VMContext` pointers used by compiled Wasm code up to
+            // date.
+            self.set_table(table_index, self.tables[table_index].vmtable());
+
+            Some(orig_size)
+        }
+    }
+
+    pub(crate) fn defined_table_fill(
+        &self,
+        table_index: DefinedTableIndex,
+        dst: u32,
+        val: TableElement,
+        len: u32,
+    ) -> Result<(), Trap> {
+        self.tables.get(table_index).unwrap().fill(dst, val, len)
     }
 
     // Get table element by index.
-    fn table_get(
-        &self,
-        table_index: DefinedTableIndex,
-        index: u32,
-    ) -> Option<VMCallerCheckedAnyfunc> {
+    fn table_get(&self, table_index: DefinedTableIndex, index: u32) -> Option<TableElement> {
         self.tables
             .get(table_index)
             .unwrap_or_else(|| panic!("no table for index {}", table_index.index()))
@@ -545,7 +516,7 @@ impl Instance {
         &self,
         table_index: DefinedTableIndex,
         index: u32,
-        val: VMCallerCheckedAnyfunc,
+        val: TableElement,
     ) -> Result<(), ()> {
         self.tables
             .get(table_index)
@@ -561,30 +532,25 @@ impl Instance {
         Layout::from_size_align(size, align).unwrap()
     }
 
-    /// Get a `VMCallerCheckedAnyfunc` for the given `FuncIndex`.
-    fn get_caller_checked_anyfunc(&self, index: FuncIndex) -> VMCallerCheckedAnyfunc {
+    /// Get a `&VMCallerCheckedAnyfunc` for the given `FuncIndex`.
+    ///
+    /// Returns `None` if the index is the reserved index value.
+    ///
+    /// The returned reference is a stable reference that won't be moved and can
+    /// be passed into JIT code.
+    pub(crate) fn get_caller_checked_anyfunc(
+        &self,
+        index: FuncIndex,
+    ) -> Option<&VMCallerCheckedAnyfunc> {
         if index == FuncIndex::reserved_value() {
-            return VMCallerCheckedAnyfunc::default();
+            return None;
         }
 
-        let sig = self.module.local.functions[index];
-        let type_index = self.signature_id(sig);
+        Some(unsafe { &*self.anyfunc_ptr(index) })
+    }
 
-        let (func_ptr, vmctx) = if let Some(def_index) = self.module.local.defined_func_index(index)
-        {
-            (
-                self.finished_functions[def_index] as *const _,
-                self.vmctx_ptr(),
-            )
-        } else {
-            let import = self.imported_function(index);
-            (import.body, import.vmctx)
-        };
-        VMCallerCheckedAnyfunc {
-            func_ptr,
-            type_index,
-            vmctx,
-        }
+    unsafe fn anyfunc_ptr(&self, index: FuncIndex) -> *mut VMCallerCheckedAnyfunc {
+        self.vmctx_plus_offset(self.offsets.vmctx_anyfunc(index))
     }
 
     /// The `table.init` operation: initializes a portion of a table with a
@@ -601,7 +567,6 @@ impl Instance {
         dst: u32,
         src: u32,
         len: u32,
-        source_loc: ir::SourceLoc,
     ) -> Result<(), Trap> {
         // https://webassembly.github.io/bulk-memory-operations/core/exec/instructions.html#exec-table-init
 
@@ -617,13 +582,13 @@ impl Instance {
             .map_or(true, |n| n as usize > elem.len())
             || dst.checked_add(len).map_or(true, |m| m > table.size())
         {
-            return Err(Trap::wasm(source_loc, ir::TrapCode::TableOutOfBounds));
+            return Err(Trap::wasm(ir::TrapCode::TableOutOfBounds));
         }
 
         // TODO(#983): investigate replacing this get/set loop with a `memcpy`.
         for (dst, src) in (dst..dst + len).zip(src..src + len) {
             table
-                .set(dst, elem[src as usize].clone())
+                .set(dst, TableElement::FuncRef(elem[src as usize]))
                 .expect("should never panic because we already did the bounds check above");
         }
 
@@ -652,7 +617,6 @@ impl Instance {
         dst: u32,
         src: u32,
         len: u32,
-        source_loc: ir::SourceLoc,
     ) -> Result<(), Trap> {
         // https://webassembly.github.io/reference-types/core/exec/instructions.html#exec-memory-copy
 
@@ -665,7 +629,7 @@ impl Instance {
                 .checked_add(len)
                 .map_or(true, |m| m as usize > memory.current_length)
         {
-            return Err(Trap::wasm(source_loc, ir::TrapCode::HeapOutOfBounds));
+            return Err(Trap::wasm(ir::TrapCode::HeapOutOfBounds));
         }
 
         let dst = usize::try_from(dst).unwrap();
@@ -689,14 +653,13 @@ impl Instance {
         dst: u32,
         src: u32,
         len: u32,
-        source_loc: ir::SourceLoc,
     ) -> Result<(), Trap> {
         let import = self.imported_memory(memory_index);
         unsafe {
             let foreign_instance = (&*import.vmctx).instance();
             let foreign_memory = &*import.from;
             let foreign_index = foreign_instance.memory_index(foreign_memory);
-            foreign_instance.defined_memory_copy(foreign_index, dst, src, len, source_loc)
+            foreign_instance.defined_memory_copy(foreign_index, dst, src, len)
         }
     }
 
@@ -711,7 +674,6 @@ impl Instance {
         dst: u32,
         val: u32,
         len: u32,
-        source_loc: ir::SourceLoc,
     ) -> Result<(), Trap> {
         let memory = self.memory(memory_index);
 
@@ -719,7 +681,7 @@ impl Instance {
             .checked_add(len)
             .map_or(true, |m| m as usize > memory.current_length)
         {
-            return Err(Trap::wasm(source_loc, ir::TrapCode::HeapOutOfBounds));
+            return Err(Trap::wasm(ir::TrapCode::HeapOutOfBounds));
         }
 
         let dst = isize::try_from(dst).unwrap();
@@ -746,14 +708,13 @@ impl Instance {
         dst: u32,
         val: u32,
         len: u32,
-        source_loc: ir::SourceLoc,
     ) -> Result<(), Trap> {
         let import = self.imported_memory(memory_index);
         unsafe {
             let foreign_instance = (&*import.vmctx).instance();
             let foreign_memory = &*import.from;
             let foreign_index = foreign_instance.memory_index(foreign_memory);
-            foreign_instance.defined_memory_fill(foreign_index, dst, val, len, source_loc)
+            foreign_instance.defined_memory_fill(foreign_index, dst, val, len)
         }
     }
 
@@ -771,7 +732,6 @@ impl Instance {
         dst: u32,
         src: u32,
         len: u32,
-        source_loc: ir::SourceLoc,
     ) -> Result<(), Trap> {
         // https://webassembly.github.io/bulk-memory-operations/core/exec/instructions.html#exec-memory-init
 
@@ -788,7 +748,7 @@ impl Instance {
                 .checked_add(len)
                 .map_or(true, |m| m as usize > memory.current_length)
         {
-            return Err(Trap::wasm(source_loc, ir::TrapCode::HeapOutOfBounds));
+            return Err(Trap::wasm(ir::TrapCode::HeapOutOfBounds));
         }
 
         let src_slice = &data[src as usize..(src + len) as usize];
@@ -831,6 +791,21 @@ impl Instance {
         let foreign_index = foreign_instance.table_index(foreign_table);
         &foreign_instance.tables[foreign_index]
     }
+
+    pub(crate) fn get_defined_table_index_and_instance(
+        &self,
+        index: TableIndex,
+    ) -> (DefinedTableIndex, &Instance) {
+        if let Some(defined_table_index) = self.module.local.defined_table_index(index) {
+            (defined_table_index, self)
+        } else {
+            let import = self.imported_table(index);
+            let foreign_instance = unsafe { (&mut *(import).vmctx).instance() };
+            let foreign_table_def = unsafe { &mut *(import).from };
+            let foreign_table_index = foreign_instance.table_index(foreign_table_def);
+            (foreign_table_index, foreign_instance)
+        }
+    }
 }
 
 /// A handle holding an `Instance` of a WebAssembly module.
@@ -855,19 +830,26 @@ impl InstanceHandle {
     /// internally if you'd like to do so. If possible it's recommended to use
     /// the `wasmtime` crate API rather than this type since that is vetted for
     /// safety.
+    ///
+    /// It is your responsibility to ensure that the given raw
+    /// `externref_activations_table` and `stack_map_registry` outlive this
+    /// instance.
     pub unsafe fn new(
         module: Arc<Module>,
-        trap_registration: TrapRegistration,
+        code: Arc<dyn Any>,
         finished_functions: BoxedSlice<DefinedFuncIndex, *mut [VMFunctionBody]>,
         trampolines: HashMap<VMSharedSignatureIndex, VMTrampoline>,
         imports: Imports,
         mem_creator: Option<&dyn RuntimeMemoryCreator>,
-        data_initializers: &[DataInitializer<'_>],
         vmshared_signatures: BoxedSlice<SignatureIndex, VMSharedSignatureIndex>,
-        dbg_jit_registration: Option<Rc<GdbJitImageRegistration>>,
-        is_bulk_memory: bool,
         host_state: Box<dyn Any>,
+        interrupts: Arc<VMInterrupts>,
+        externref_activations_table: *mut VMExternRefActivationsTable,
+        stack_map_registry: *mut StackMapRegistry,
     ) -> Result<Self, InstantiationError> {
+        debug_assert!(!externref_activations_table.is_null());
+        debug_assert!(!stack_map_registry.is_null());
+
         let tables = create_tables(&module);
         let memories = create_memories(&module, mem_creator.unwrap_or(&DefaultMemoryCreator {}))?;
 
@@ -891,9 +873,8 @@ impl InstanceHandle {
 
         let handle = {
             let instance = Instance {
-                refcount: Cell::new(1),
-                dependencies: imports.dependencies,
                 module,
+                code,
                 offsets,
                 memories,
                 tables,
@@ -901,10 +882,8 @@ impl InstanceHandle {
                 passive_data,
                 finished_functions,
                 trampolines,
-                dbg_jit_registration,
                 host_state,
-                signal_handler: Cell::new(None),
-                trap_registration,
+                interrupts,
                 vmctx: VMContext {},
             };
             let layout = instance.alloc_layout();
@@ -963,31 +942,65 @@ impl InstanceHandle {
             instance.builtin_functions_ptr() as *mut VMBuiltinFunctionsArray,
             VMBuiltinFunctionsArray::initialized(),
         );
+        *instance.interrupts() = &*instance.interrupts;
+        *instance.externref_activations_table() = externref_activations_table;
+        *instance.stack_map_registry() = stack_map_registry;
 
+        for (index, sig) in instance.module.local.functions.iter() {
+            let type_index = instance.signature_id(*sig);
+
+            let (func_ptr, vmctx) =
+                if let Some(def_index) = instance.module.local.defined_func_index(index) {
+                    (
+                        NonNull::new(instance.finished_functions[def_index] as *mut _).unwrap(),
+                        instance.vmctx_ptr(),
+                    )
+                } else {
+                    let import = instance.imported_function(index);
+                    (import.body, import.vmctx)
+                };
+
+            ptr::write(
+                instance.anyfunc_ptr(index),
+                VMCallerCheckedAnyfunc {
+                    func_ptr,
+                    type_index,
+                    vmctx,
+                },
+            );
+        }
+
+        // Perform infallible initialization in this constructor, while fallible
+        // initialization is deferred to the `initialize` method.
+        initialize_passive_elements(instance);
+        initialize_globals(instance);
+
+        Ok(handle)
+    }
+
+    /// Finishes the instantiation process started by `Instance::new`.
+    ///
+    /// Only safe to call immediately after instantiation.
+    pub unsafe fn initialize(
+        &self,
+        is_bulk_memory: bool,
+        data_initializers: &[DataInitializer<'_>],
+    ) -> Result<(), InstantiationError> {
         // Check initializer bounds before initializing anything. Only do this
         // when bulk memory is disabled, since the bulk memory proposal changes
         // instantiation such that the intermediate results of failed
         // initializations are visible.
         if !is_bulk_memory {
-            check_table_init_bounds(instance)?;
-            check_memory_init_bounds(instance, data_initializers)?;
+            check_table_init_bounds(self.instance())?;
+            check_memory_init_bounds(self.instance(), data_initializers)?;
         }
 
-        // Apply the initializers.
-        initialize_tables(instance)?;
-        initialize_passive_elements(instance);
-        initialize_memories(instance, data_initializers)?;
-        initialize_globals(instance);
+        // Apply fallible initializers. Note that this can "leak" state even if
+        // it fails.
+        initialize_tables(self.instance())?;
+        initialize_memories(self.instance(), data_initializers)?;
 
-        // Ensure that our signal handlers are ready for action.
-        // TODO: Move these calls out of `InstanceHandle`.
-        traphandlers::init();
-
-        // The WebAssembly spec specifies that the start function is
-        // invoked automatically at instantiation time.
-        instance.invoke_start_function()?;
-
-        Ok(handle)
+        Ok(())
     }
 
     /// Create a new `InstanceHandle` pointing at the instance
@@ -998,7 +1011,6 @@ impl InstanceHandle {
     /// be a `VMContext` allocated as part of an `Instance`.
     pub unsafe fn from_vmctx(vmctx: *mut VMContext) -> Self {
         let instance = (&mut *vmctx).instance();
-        instance.refcount.set(instance.refcount.get() + 1);
         Self {
             instance: instance as *const Instance as *mut Instance,
         }
@@ -1014,14 +1026,9 @@ impl InstanceHandle {
         self.instance().vmctx_ptr()
     }
 
-    /// Return a reference-counting pointer to a module.
-    pub fn module(&self) -> &Arc<Module> {
-        self.instance().module()
-    }
-
     /// Return a reference to a module.
-    pub fn module_ref(&self) -> &Module {
-        self.instance().module_ref()
+    pub fn module(&self) -> &Module {
+        self.instance().module()
     }
 
     /// Lookup an export with the given name.
@@ -1030,7 +1037,7 @@ impl InstanceHandle {
     }
 
     /// Lookup an export with the given export declaration.
-    pub fn lookup_by_declaration(&self, export: &wasmtime_environ::Export) -> Export {
+    pub fn lookup_by_declaration(&self, export: &EntityIndex) -> Export {
         self.instance().lookup_by_declaration(export)
     }
 
@@ -1039,7 +1046,7 @@ impl InstanceHandle {
     /// Specifically, it provides access to the key-value pairs, where the keys
     /// are export names, and the values are export declarations which can be
     /// resolved `lookup_by_declaration`.
-    pub fn exports(&self) -> indexmap::map::Iter<String, wasmtime_environ::Export> {
+    pub fn exports(&self) -> indexmap::map::Iter<String, EntityIndex> {
         self.instance().exports()
     }
 
@@ -1066,22 +1073,43 @@ impl InstanceHandle {
         self.instance().table_index(table)
     }
 
-    /// Grow table in this instance by the specified amount of pages.
+    /// Grow table in this instance by the specified amount of elements.
     ///
-    /// Returns `None` if memory can't be grown by the specified amount
-    /// of pages.
-    pub fn table_grow(&self, table_index: DefinedTableIndex, delta: u32) -> Option<u32> {
-        self.instance().table_grow(table_index, delta)
+    /// When the table is successfully grown, returns the original size of the
+    /// table.
+    ///
+    /// Returns `None` if memory can't be grown by the specified amount of pages
+    /// or if the `init_value` is the incorrect table element type.
+    pub fn table_grow(
+        &self,
+        table_index: TableIndex,
+        delta: u32,
+        init_value: TableElement,
+    ) -> Option<u32> {
+        self.instance().table_grow(table_index, delta, init_value)
+    }
+
+    /// Grow table in this instance by the specified amount of elements.
+    ///
+    /// When the table is successfully grown, returns the original size of the
+    /// table.
+    ///
+    /// Returns `None` if memory can't be grown by the specified amount of pages
+    /// or if the `init_value` is the incorrect table element type.
+    pub fn defined_table_grow(
+        &self,
+        table_index: DefinedTableIndex,
+        delta: u32,
+        init_value: TableElement,
+    ) -> Option<u32> {
+        self.instance()
+            .defined_table_grow(table_index, delta, init_value)
     }
 
     /// Get table element reference.
     ///
     /// Returns `None` if index is out of bounds.
-    pub fn table_get(
-        &self,
-        table_index: DefinedTableIndex,
-        index: u32,
-    ) -> Option<VMCallerCheckedAnyfunc> {
+    pub fn table_get(&self, table_index: DefinedTableIndex, index: u32) -> Option<TableElement> {
         self.instance().table_get(table_index, index)
     }
 
@@ -1092,9 +1120,24 @@ impl InstanceHandle {
         &self,
         table_index: DefinedTableIndex,
         index: u32,
-        val: VMCallerCheckedAnyfunc,
+        val: TableElement,
     ) -> Result<(), ()> {
         self.instance().table_set(table_index, index, val)
+    }
+
+    /// Fill a region of the table.
+    ///
+    /// Returns an error if the region is out of bounds or val is not of the
+    /// correct type.
+    pub fn defined_table_fill(
+        &self,
+        table_index: DefinedTableIndex,
+        dst: u32,
+        val: TableElement,
+        len: u32,
+    ) -> Result<(), Trap> {
+        self.instance()
+            .defined_table_fill(table_index, dst, val, len)
     }
 
     /// Get a table defined locally within this module.
@@ -1111,36 +1154,34 @@ impl InstanceHandle {
     pub(crate) fn instance(&self) -> &Instance {
         unsafe { &*(self.instance as *const Instance) }
     }
-}
 
-impl Clone for InstanceHandle {
-    fn clone(&self) -> Self {
-        let instance = self.instance();
-        instance.refcount.set(instance.refcount.get() + 1);
-        Self {
+    /// Returns a clone of this instance.
+    ///
+    /// This is unsafe because the returned handle here is just a cheap clone
+    /// of the internals, there's no lifetime tracking around its validity.
+    /// You'll need to ensure that the returned handles all go out of scope at
+    /// the same time.
+    pub unsafe fn clone(&self) -> InstanceHandle {
+        InstanceHandle {
             instance: self.instance,
         }
     }
-}
 
-impl Drop for InstanceHandle {
-    fn drop(&mut self) {
+    /// Deallocates memory associated with this instance.
+    ///
+    /// Note that this is unsafe because there might be other handles to this
+    /// `InstanceHandle` elsewhere, and there's nothing preventing usage of
+    /// this handle after this function is called.
+    pub unsafe fn dealloc(&self) {
         let instance = self.instance();
-        let count = instance.refcount.get();
-        instance.refcount.set(count - 1);
-        if count == 1 {
-            let layout = instance.alloc_layout();
-            unsafe {
-                ptr::drop_in_place(self.instance);
-                alloc::dealloc(self.instance.cast(), layout);
-            }
-        }
+        let layout = instance.alloc_layout();
+        ptr::drop_in_place(self.instance);
+        alloc::dealloc(self.instance.cast(), layout);
     }
 }
 
 fn check_table_init_bounds(instance: &Instance) -> Result<(), InstantiationError> {
-    let module = Arc::clone(&instance.module);
-    for init in &module.table_elements {
+    for init in &instance.module().table_elements {
         let start = get_table_init_start(init, instance);
         let table = instance.get_table(init.table_index);
 
@@ -1215,7 +1256,7 @@ fn check_memory_init_bounds(
 
 /// Allocate memory for just the tables of the current module.
 fn create_tables(module: &Module) -> BoxedSlice<DefinedTableIndex, Table> {
-    let num_imports = module.imported_tables.len();
+    let num_imports = module.local.num_imported_tables;
     let mut tables: PrimaryMap<DefinedTableIndex, _> =
         PrimaryMap::with_capacity(module.local.table_plans.len() - num_imports);
     for table in &module.local.table_plans.values().as_slice()[num_imports..] {
@@ -1244,8 +1285,7 @@ fn get_table_init_start(init: &TableElements, instance: &Instance) -> usize {
 
 /// Initialize the table memory from the provided initializers.
 fn initialize_tables(instance: &Instance) -> Result<(), InstantiationError> {
-    let module = Arc::clone(&instance.module);
-    for init in &module.table_elements {
+    for init in &instance.module().table_elements {
         let start = get_table_init_start(init, instance);
         let table = instance.get_table(init.table_index);
 
@@ -1254,15 +1294,19 @@ fn initialize_tables(instance: &Instance) -> Result<(), InstantiationError> {
             .map_or(true, |end| end > table.size() as usize)
         {
             return Err(InstantiationError::Trap(Trap::wasm(
-                ir::SourceLoc::default(),
                 ir::TrapCode::HeapOutOfBounds,
             )));
         }
 
         for (i, func_idx) in init.elements.iter().enumerate() {
-            let anyfunc = instance.get_caller_checked_anyfunc(*func_idx);
+            let anyfunc = instance.get_caller_checked_anyfunc(*func_idx).map_or(
+                ptr::null_mut(),
+                |f: &VMCallerCheckedAnyfunc| {
+                    f as *const VMCallerCheckedAnyfunc as *mut VMCallerCheckedAnyfunc
+                },
+            );
             table
-                .set(u32::try_from(start + i).unwrap(), anyfunc)
+                .set(u32::try_from(start + i).unwrap(), anyfunc.into())
                 .unwrap();
         }
     }
@@ -1291,7 +1335,14 @@ fn initialize_passive_elements(instance: &Instance) {
                     *idx,
                     segments
                         .iter()
-                        .map(|s| instance.get_caller_checked_anyfunc(*s))
+                        .map(|s| {
+                            instance.get_caller_checked_anyfunc(*s).map_or(
+                                ptr::null_mut(),
+                                |f: &VMCallerCheckedAnyfunc| {
+                                    f as *const VMCallerCheckedAnyfunc as *mut _
+                                },
+                            )
+                        })
                         .collect(),
                 )
             }),
@@ -1303,7 +1354,7 @@ fn create_memories(
     module: &Module,
     mem_creator: &dyn RuntimeMemoryCreator,
 ) -> Result<BoxedSlice<DefinedMemoryIndex, Box<dyn RuntimeLinearMemory>>, InstantiationError> {
-    let num_imports = module.imported_memories.len();
+    let num_imports = module.local.num_imported_memories;
     let mut memories: PrimaryMap<DefinedMemoryIndex, _> =
         PrimaryMap::with_capacity(module.local.memory_plans.len() - num_imports);
     for plan in &module.local.memory_plans.values().as_slice()[num_imports..] {
@@ -1330,7 +1381,6 @@ fn initialize_memories(
             .map_or(true, |end| end > memory.current_length)
         {
             return Err(InstantiationError::Trap(Trap::wasm(
-                ir::SourceLoc::default(),
                 ir::TrapCode::HeapOutOfBounds,
             )));
         }
@@ -1349,7 +1399,7 @@ fn initialize_memories(
 /// Allocate memory for just the globals of the current module,
 /// with initializers applied.
 fn create_globals(module: &Module) -> BoxedSlice<DefinedGlobalIndex, VMGlobalDefinition> {
-    let num_imports = module.imported_globals.len();
+    let num_imports = module.local.num_imported_globals;
     let mut vmctx_globals = PrimaryMap::with_capacity(module.local.globals.len() - num_imports);
 
     for _ in &module.local.globals.values().as_slice()[num_imports..] {
@@ -1360,8 +1410,8 @@ fn create_globals(module: &Module) -> BoxedSlice<DefinedGlobalIndex, VMGlobalDef
 }
 
 fn initialize_globals(instance: &Instance) {
-    let module = Arc::clone(&instance.module);
-    let num_imports = module.imported_globals.len();
+    let module = instance.module();
+    let num_imports = module.local.num_imported_globals;
     for (index, global) in module.local.globals.iter().skip(num_imports) {
         let def_index = module.local.defined_global_index(index).unwrap();
         unsafe {
@@ -1380,8 +1430,16 @@ fn initialize_globals(instance: &Instance) {
                     };
                     *to = from;
                 }
+                GlobalInit::RefFunc(f) => {
+                    *(*to).as_anyfunc_mut() = instance.get_caller_checked_anyfunc(f).unwrap()
+                        as *const VMCallerCheckedAnyfunc;
+                }
+                GlobalInit::RefNullConst => match global.wasm_ty {
+                    WasmType::FuncRef => *(*to).as_anyfunc_mut() = ptr::null(),
+                    WasmType::ExternRef => *(*to).as_externref_mut() = None,
+                    ty => panic!("unsupported reference type for global: {:?}", ty),
+                },
                 GlobalInit::Import => panic!("locally-defined global initialized as import"),
-                GlobalInit::RefNullConst | GlobalInit::RefFunc(_) => unimplemented!(),
             }
         }
     }
@@ -1405,9 +1463,5 @@ pub enum InstantiationError {
 
     /// A trap ocurred during instantiation, after linking.
     #[error("Trap occurred during instantiation")]
-    Trap(#[source] Trap),
-
-    /// A compilation error occured.
-    #[error("Trap occurred while invoking start function")]
-    StartTrap(#[source] Trap),
+    Trap(Trap),
 }

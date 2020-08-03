@@ -1,8 +1,8 @@
 use anyhow::{anyhow, bail, Context as _, Result};
-use faerie::Artifact;
+use object::write::Object;
 use target_lexicon::Triple;
 use wasmtime::Strategy;
-use wasmtime_debug::{emit_debugsections, read_debuginfo};
+use wasmtime_debug::{emit_dwarf, read_debuginfo};
 #[cfg(feature = "lightbeam")]
 use wasmtime_environ::Lightbeam;
 use wasmtime_environ::{
@@ -11,7 +11,7 @@ use wasmtime_environ::{
     ModuleVmctxInfo, Tunables, VMOffsets,
 };
 use wasmtime_jit::native;
-use wasmtime_obj::emit_module;
+use wasmtime_obj::{emit_module, ObjectBuilderTarget};
 
 /// Creates object file from binary wasm data.
 pub fn compile_to_obj(
@@ -21,9 +21,8 @@ pub fn compile_to_obj(
     enable_simd: bool,
     opt_level: wasmtime::OptLevel,
     debug_info: bool,
-    artifact_name: String,
     cache_config: &CacheConfig,
-) -> Result<Artifact> {
+) -> Result<Object> {
     let isa_builder = match target {
         Some(target) => native::lookup(target.clone())?,
         None => native::builder(),
@@ -51,7 +50,7 @@ pub fn compile_to_obj(
 
     let isa = isa_builder.finish(settings::Flags::new(flag_builder));
 
-    let mut obj = Artifact::new(isa.triple().clone(), artifact_name);
+    let target = ObjectBuilderTarget::from_triple(isa.triple())?;
 
     // TODO: Expose the tunables as command-line flags.
     let mut tunables = Tunables::default();
@@ -63,7 +62,7 @@ pub fn compile_to_obj(
         .translate(wasm)
         .context("failed to translate module")?;
 
-    // TODO: use the traps information
+    // TODO: use the traps and stack maps information.
     let (
         compilation,
         relocations,
@@ -71,7 +70,7 @@ pub fn compile_to_obj(
         value_ranges,
         stack_slots,
         _traps,
-        frame_layouts,
+        _stack_maps,
     ) = match strategy {
         Strategy::Auto | Strategy::Cranelift => {
             Cranelift::compile_module(&translation, &*isa, cache_config)
@@ -107,29 +106,30 @@ pub fn compile_to_obj(
         }
     };
 
-    emit_module(
-        &mut obj,
-        &translation.module,
-        &compilation,
-        &relocations,
-        &translation.data_initializers,
-        &translation.target_config,
-    )
-    .map_err(|e| anyhow!(e))
-    .context("failed to emit module")?;
-
-    if debug_info {
+    let dwarf_sections = if debug_info {
         let debug_data = read_debuginfo(wasm).context("failed to emit DWARF")?;
-        emit_debugsections(
-            &mut obj,
-            &module_vmctx_info,
+        emit_dwarf(
             &*isa,
             &debug_data,
             &address_transform,
+            &module_vmctx_info,
             &value_ranges,
-            &frame_layouts,
+            &compilation.unwind_info(),
         )
-        .context("failed to emit debug sections")?;
-    }
-    Ok(obj)
+        .context("failed to emit debug sections")?
+    } else {
+        vec![]
+    };
+
+    Ok(emit_module(
+        target,
+        &translation.module,
+        &translation.target_config,
+        compilation,
+        relocations,
+        dwarf_sections,
+        &translation.data_initializers,
+    )
+    .map_err(|e| anyhow!(e))
+    .context("failed to emit module")?)
 }

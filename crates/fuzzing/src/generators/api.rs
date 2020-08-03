@@ -22,6 +22,7 @@ use wasmparser::*;
 #[derive(Arbitrary, Debug)]
 struct Swarm {
     config_debug_info: bool,
+    config_interruptable: bool,
     module_new: bool,
     module_drop: bool,
     instance_new: bool,
@@ -35,6 +36,7 @@ struct Swarm {
 pub enum ApiCall {
     ConfigNew,
     ConfigDebugInfo(bool),
+    ConfigInterruptable(bool),
     EngineNew,
     StoreNew,
     ModuleNew { id: usize, wasm: super::WasmOptTtf },
@@ -163,9 +165,10 @@ impl Arbitrary for ApiCalls {
                 // minimum size.
                 arbitrary::size_hint::and(
                     <Swarm as Arbitrary>::size_hint(depth),
-                    // `arbitrary_config` uses two bools when
-                    // `swarm.config_debug_info` is true.
-                    <(bool, bool) as Arbitrary>::size_hint(depth),
+                    // `arbitrary_config` uses four bools:
+                    // 2 when `swarm.config_debug_info` is true
+                    // 2 when `swarm.config_interruptable` is true
+                    <(bool, bool, bool, bool) as Arbitrary>::size_hint(depth),
                 ),
                 // We can generate arbitrary `WasmOptTtf` instances, which have
                 // no upper bound on the number of bytes they consume. This sets
@@ -187,6 +190,10 @@ fn arbitrary_config(
         calls.push(ConfigDebugInfo(bool::arbitrary(input)?));
     }
 
+    if swarm.config_interruptable && bool::arbitrary(input)? {
+        calls.push(ConfigInterruptable(bool::arbitrary(input)?));
+    }
+
     // TODO: flags, features, and compilation strategy.
 
     Ok(())
@@ -206,14 +213,12 @@ fn arbitrary_config(
 /// it'll free up new slots to start making new instances.
 fn predict_rss(wasm: &[u8]) -> Result<usize> {
     let mut prediction = 0;
-    let mut reader = ModuleReader::new(wasm)?;
-    while !reader.eof() {
-        let section = reader.read()?;
-        match section.code {
+    for payload in Parser::new(0).parse_all(wasm) {
+        match payload? {
             // For each declared memory we'll have to map that all in, so add in
             // the minimum amount of memory to our predicted rss.
-            SectionCode::Memory => {
-                for entry in section.get_memory_section_reader()? {
+            Payload::MemorySection(s) => {
+                for entry in s {
                     let initial = entry?.limits.initial as usize;
                     prediction += initial * 64 * 1024;
                 }
@@ -221,8 +226,8 @@ fn predict_rss(wasm: &[u8]) -> Result<usize> {
 
             // We'll need to allocate tables and space for table elements, and
             // currently this is 3 pointers per table entry.
-            SectionCode::Table => {
-                for entry in section.get_table_section_reader()? {
+            Payload::TableSection(s) => {
+                for entry in s {
                     let initial = entry?.limits.initial as usize;
                     prediction += initial * 3 * mem::size_of::<usize>();
                 }

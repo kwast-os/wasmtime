@@ -211,7 +211,7 @@ fn define_control_flow(
     let iAddr = &TypeVar::new(
         "iAddr",
         "An integer address type",
-        TypeSetBuilder::new().ints(32..64).build(),
+        TypeSetBuilder::new().ints(32..64).refs(32..64).build(),
     );
 
     {
@@ -340,7 +340,21 @@ fn define_control_flow(
                 r#"
         Trap when non-zero.
 
-        if ``c`` is zero, execution continues at the following instruction.
+        If ``c`` is zero, execution continues at the following instruction.
+        "#,
+                &formats.cond_trap,
+            )
+            .operands_in(vec![c, code])
+            .can_trap(true),
+        );
+
+        ig.push(
+            Inst::new(
+                "resumable_trapnz",
+                r#"
+        A resumable trap to be called when the passed condition is non-zero.
+
+        If ``c`` is zero, execution continues at the following instruction.
         "#,
                 &formats.cond_trap,
             )
@@ -535,9 +549,9 @@ fn define_simd_lane_access(
             r#"
         Vector swizzle.
 
-        Returns a new vector with byte-width lanes selected from the lanes of the first input 
-        vector ``x`` specified in the second input vector ``s``. The indices ``i`` in range 
-        ``[0, 15]`` select the ``i``-th element of ``x``. For indices outside of the range the 
+        Returns a new vector with byte-width lanes selected from the lanes of the first input
+        vector ``x`` specified in the second input vector ``s``. The indices ``i`` in range
+        ``[0, 15]`` select the ``i``-th element of ``x``. For indices outside of the range the
         resulting lane is 0. Note that this operates on byte-width lanes.
         "#,
             &formats.binary,
@@ -559,9 +573,9 @@ fn define_simd_lane_access(
         The lane index, ``Idx``, is an immediate value, not an SSA value. It
         must indicate a valid lane index for the type of ``x``.
         "#,
-            &formats.insert_lane,
+            &formats.ternary_imm8,
         )
-        .operands_in(vec![x, Idx, y])
+        .operands_in(vec![x, y, Idx])
         .operands_out(vec![a]),
     );
 
@@ -579,7 +593,7 @@ fn define_simd_lane_access(
         may or may not be zeroed depending on the ISA but the type system should prevent using
         ``a`` as anything other than the extracted value.
         "#,
-            &formats.extract_lane,
+            &formats.binary_imm8,
         )
         .operands_in(vec![x, Idx])
         .operands_out(vec![a]),
@@ -730,7 +744,7 @@ pub(crate) fn define(
     let iAddr = &TypeVar::new(
         "iAddr",
         "An integer address type",
-        TypeSetBuilder::new().ints(32..64).build(),
+        TypeSetBuilder::new().ints(32..64).refs(32..64).build(),
     );
 
     let Ref = &TypeVar::new(
@@ -1162,7 +1176,7 @@ pub(crate) fn define(
         Inst::new(
             "uload8x8",
             r#"
-        Load an 8x8 vector (64 bits) from memory at ``p + Offset`` and zero-extend into an i16x8 
+        Load an 8x8 vector (64 bits) from memory at ``p + Offset`` and zero-extend into an i16x8
         vector.
         "#,
             &formats.load,
@@ -1174,14 +1188,42 @@ pub(crate) fn define(
 
     ig.push(
         Inst::new(
+            "uload8x8_complex",
+            r#"
+        Load an 8x8 vector (64 bits) from memory at ``sum(args) + Offset`` and zero-extend into an
+        i16x8 vector.
+        "#,
+            &formats.load_complex,
+        )
+        .operands_in(vec![MemFlags, args, Offset])
+        .operands_out(vec![a])
+        .can_load(true),
+    );
+
+    ig.push(
+        Inst::new(
             "sload8x8",
             r#"
-        Load an 8x8 vector (64 bits) from memory at ``p + Offset`` and sign-extend into an i16x8 
+        Load an 8x8 vector (64 bits) from memory at ``p + Offset`` and sign-extend into an i16x8
         vector.
         "#,
             &formats.load,
         )
         .operands_in(vec![MemFlags, p, Offset])
+        .operands_out(vec![a])
+        .can_load(true),
+    );
+
+    ig.push(
+        Inst::new(
+            "sload8x8_complex",
+            r#"
+        Load an 8x8 vector (64 bits) from memory at ``sum(args) + Offset`` and sign-extend into an
+        i16x8 vector.
+        "#,
+            &formats.load_complex,
+        )
+        .operands_in(vec![MemFlags, args, Offset])
         .operands_out(vec![a])
         .can_load(true),
     );
@@ -1201,7 +1243,7 @@ pub(crate) fn define(
         Inst::new(
             "uload16x4",
             r#"
-        Load an 16x4 vector (64 bits) from memory at ``p + Offset`` and zero-extend into an i32x4 
+        Load a 16x4 vector (64 bits) from memory at ``p + Offset`` and zero-extend into an i32x4
         vector.
         "#,
             &formats.load,
@@ -1213,14 +1255,42 @@ pub(crate) fn define(
 
     ig.push(
         Inst::new(
+            "uload16x4_complex",
+            r#"
+        Load a 16x4 vector (64 bits) from memory at ``sum(args) + Offset`` and zero-extend into an
+        i32x4 vector.
+        "#,
+            &formats.load_complex,
+        )
+        .operands_in(vec![MemFlags, args, Offset])
+        .operands_out(vec![a])
+        .can_load(true),
+    );
+
+    ig.push(
+        Inst::new(
             "sload16x4",
             r#"
-        Load a 16x4 vector (64 bits) from memory at ``p + Offset`` and sign-extend into an i32x4 
+        Load a 16x4 vector (64 bits) from memory at ``p + Offset`` and sign-extend into an i32x4
         vector.
         "#,
             &formats.load,
         )
         .operands_in(vec![MemFlags, p, Offset])
+        .operands_out(vec![a])
+        .can_load(true),
+    );
+
+    ig.push(
+        Inst::new(
+            "sload16x4_complex",
+            r#"
+        Load a 16x4 vector (64 bits) from memory at ``sum(args) + Offset`` and sign-extend into an
+        i32x4 vector.
+        "#,
+            &formats.load_complex,
+        )
+        .operands_in(vec![MemFlags, args, Offset])
         .operands_out(vec![a])
         .can_load(true),
     );
@@ -1240,7 +1310,7 @@ pub(crate) fn define(
         Inst::new(
             "uload32x2",
             r#"
-        Load an 32x2 vector (64 bits) from memory at ``p + Offset`` and zero-extend into an i64x2 
+        Load an 32x2 vector (64 bits) from memory at ``p + Offset`` and zero-extend into an i64x2
         vector.
         "#,
             &formats.load,
@@ -1252,14 +1322,42 @@ pub(crate) fn define(
 
     ig.push(
         Inst::new(
+            "uload32x2_complex",
+            r#"
+        Load a 32x2 vector (64 bits) from memory at ``sum(args) + Offset`` and zero-extend into an
+        i64x2 vector.
+        "#,
+            &formats.load_complex,
+        )
+        .operands_in(vec![MemFlags, args, Offset])
+        .operands_out(vec![a])
+        .can_load(true),
+    );
+
+    ig.push(
+        Inst::new(
             "sload32x2",
             r#"
-        Load a 32x2 vector (64 bits) from memory at ``p + Offset`` and sign-extend into an i64x2 
+        Load a 32x2 vector (64 bits) from memory at ``p + Offset`` and sign-extend into an i64x2
         vector.
         "#,
             &formats.load,
         )
         .operands_in(vec![MemFlags, p, Offset])
+        .operands_out(vec![a])
+        .can_load(true),
+    );
+
+    ig.push(
+        Inst::new(
+            "sload32x2_complex",
+            r#"
+        Load a 32x2 vector (64 bits) from memory at ``sum(args) + Offset`` and sign-extend into an
+        i64x2 vector.
+        "#,
+            &formats.load_complex,
+        )
+        .operands_in(vec![MemFlags, args, Offset])
         .operands_out(vec![a])
         .can_load(true),
     );
@@ -1542,6 +1640,21 @@ pub(crate) fn define(
         .operands_out(vec![a]),
     );
 
+    let constant =
+        &Operand::new("constant", &imm.pool_constant).with_doc("A constant in the constant pool");
+    let address = &Operand::new("address", iAddr);
+    ig.push(
+        Inst::new(
+            "const_addr",
+            r#"
+        Calculate the base address of a value in the constant pool.
+        "#,
+            &formats.unary_const,
+        )
+        .operands_in(vec![constant])
+        .operands_out(vec![address]),
+    );
+
     let mask = &Operand::new("mask", &imm.uimm128)
         .with_doc("The 16 immediate bytes used for selecting the elements to shuffle");
     let Tx16 = &TypeVar::new(
@@ -1633,6 +1746,34 @@ pub(crate) fn define(
         )
         .operands_in(vec![cc, flags, x, y])
         .operands_out(vec![a]),
+    );
+
+    ig.push(
+        Inst::new(
+            "selectif_spectre_guard",
+            r#"
+            Conditional select intended for Spectre guards.
+
+            This operation is semantically equivalent to a selectif instruction.
+            However, it is guaranteed to not be removed or otherwise altered by any
+            optimization pass, and is guaranteed to result in a conditional-move
+            instruction, not a branch-based lowering.  As such, it is suitable
+            for use when producing Spectre guards. For example, a bounds-check
+            may guard against unsafe speculation past a bounds-check conditional
+            branch by passing the address or index to be accessed through a
+            conditional move, also gated on the same condition. Because no
+            Spectre-vulnerable processors are known to perform speculation on
+            conditional move instructions, this is guaranteed to pick the
+            correct input. If the selected input in case of overflow is a "safe"
+            value, for example a null pointer that causes an exception in the
+            speculative path, this ensures that no Spectre vulnerability will
+            exist.
+            "#,
+            &formats.int_select,
+        )
+        .operands_in(vec![cc, flags, x, y])
+        .operands_out(vec![a])
+        .other_side_effects(true),
     );
 
     let c = &Operand::new("c", Any).with_doc("Controlling value to test");
@@ -2116,7 +2257,7 @@ pub(crate) fn define(
         Like `icmp_imm`, but returns integer CPU flags instead of testing
         a specific condition code.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![f]),
@@ -2166,7 +2307,7 @@ pub(crate) fn define(
         This is similar to `iadd` but the operands are interpreted as signed integers and their
         summed result, instead of wrapping, will be saturated to the lowest or highest
         signed integer for the controlling type (e.g. `0x80` or `0x7F` for i8). For example,
-        since an `iadd_ssat.i8` of `0x70` and `0x70` is greater than `0x7F`, the result will be
+        since an `sadd_sat.i8` of `0x70` and `0x70` is greater than `0x7F`, the result will be
         clamped to `0x7F`.
         "#,
             &formats.binary,
@@ -2227,6 +2368,18 @@ pub(crate) fn define(
             "ineg",
             r#"
         Integer negation: `a := -x \pmod{2^B}`.
+        "#,
+            &formats.unary,
+        )
+        .operands_in(vec![x])
+        .operands_out(vec![a]),
+    );
+
+    ig.push(
+        Inst::new(
+            "iabs",
+            r#"
+        Integer absolute value with wrapping: `a := |x|`.
         "#,
             &formats.unary,
         )
@@ -2361,7 +2514,7 @@ pub(crate) fn define(
         Polymorphic over all scalar integer types, but does not support vector
         types.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -2376,7 +2529,7 @@ pub(crate) fn define(
         Polymorphic over all scalar integer types, but does not support vector
         types.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -2390,7 +2543,7 @@ pub(crate) fn define(
 
         This operation traps if the divisor is zero.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -2406,7 +2559,7 @@ pub(crate) fn define(
         representable in `B` bits two's complement. This only happens
         when `x = -2^{B-1}, Y = -1`.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -2420,7 +2573,7 @@ pub(crate) fn define(
 
         This operation traps if the divisor is zero.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -2434,7 +2587,7 @@ pub(crate) fn define(
 
         This operation traps if the divisor is zero.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -2453,7 +2606,7 @@ pub(crate) fn define(
         Polymorphic over all scalar integer types, but does not support vector
         types.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -2853,7 +3006,7 @@ pub(crate) fn define(
         Polymorphic over all scalar integer types, but does not support vector
         types.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -2870,7 +3023,7 @@ pub(crate) fn define(
         Polymorphic over all scalar integer types, but does not support vector
         types.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -2887,7 +3040,7 @@ pub(crate) fn define(
         Polymorphic over all scalar integer types, but does not support vector
         types.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -2932,7 +3085,7 @@ pub(crate) fn define(
             r#"
         Rotate left by immediate.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -2944,7 +3097,7 @@ pub(crate) fn define(
             r#"
         Rotate right by immediate.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -3019,7 +3172,7 @@ pub(crate) fn define(
 
         The shift amount is masked to the size of ``x``.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -3033,7 +3186,7 @@ pub(crate) fn define(
 
         The shift amount is masked to the size of the register.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -3047,7 +3200,7 @@ pub(crate) fn define(
 
         The shift amount is masked to the size of the register.
         "#,
-            &formats.binary_imm,
+            &formats.binary_imm64,
         )
         .operands_in(vec![x, Y])
         .operands_out(vec![a]),
@@ -3728,6 +3881,126 @@ pub(crate) fn define(
         .operands_in(vec![x])
         .operands_out(vec![a])
         .constraints(vec![WiderOrEq(Int.clone(), IntTo.clone())]),
+    );
+
+    let I16or32xN = &TypeVar::new(
+        "I16or32xN",
+        "A SIMD vector type containing integer lanes 16 or 32 bits wide",
+        TypeSetBuilder::new()
+            .ints(16..32)
+            .simd_lanes(4..8)
+            .includes_scalars(false)
+            .build(),
+    );
+
+    let x = &Operand::new("x", I16or32xN);
+    let y = &Operand::new("y", I16or32xN);
+    let a = &Operand::new("a", &I16or32xN.split_lanes());
+
+    ig.push(
+        Inst::new(
+            "snarrow",
+            r#"
+        Combine `x` and `y` into a vector with twice the lanes but half the integer width while 
+        saturating overflowing values to the signed maximum and minimum.
+        
+        The lanes will be concatenated after narrowing. For example, when `x` and `y` are `i32x4`
+        and `x = [x3, x2, x1, x0]` and `y = [y3, y2, y1, y0]`, then after narrowing the value
+        returned is an `i16x8`: `a = [y3', y2', y1', y0', x3', x2', x1', x0']`.
+            "#,
+            &formats.binary,
+        )
+        .operands_in(vec![x, y])
+        .operands_out(vec![a]),
+    );
+
+    ig.push(
+        Inst::new(
+            "unarrow",
+            r#"
+        Combine `x` and `y` into a vector with twice the lanes but half the integer width while 
+        saturating overflowing values to the unsigned maximum and minimum.
+        
+        Note that all input lanes are considered signed: any negative lanes will overflow and be
+        replaced with the unsigned minimum, `0x00`.
+        
+        The lanes will be concatenated after narrowing. For example, when `x` and `y` are `i32x4`
+        and `x = [x3, x2, x1, x0]` and `y = [y3, y2, y1, y0]`, then after narrowing the value
+        returned is an `i16x8`: `a = [y3', y2', y1', y0', x3', x2', x1', x0']`.
+            "#,
+            &formats.binary,
+        )
+        .operands_in(vec![x, y])
+        .operands_out(vec![a]),
+    );
+
+    let I8or16xN = &TypeVar::new(
+        "I8or16xN",
+        "A SIMD vector type containing integer lanes 8 or 16 bits wide.",
+        TypeSetBuilder::new()
+            .ints(8..16)
+            .simd_lanes(8..16)
+            .includes_scalars(false)
+            .build(),
+    );
+
+    let x = &Operand::new("x", I8or16xN);
+    let a = &Operand::new("a", &I8or16xN.merge_lanes());
+
+    ig.push(
+        Inst::new(
+            "swiden_low",
+            r#"
+        Widen the low lanes of `x` using signed extension.
+        
+        This will double the lane width and halve the number of lanes.
+            "#,
+            &formats.unary,
+        )
+        .operands_in(vec![x])
+        .operands_out(vec![a]),
+    );
+
+    ig.push(
+        Inst::new(
+            "swiden_high",
+            r#"
+        Widen the high lanes of `x` using signed extension.
+        
+        This will double the lane width and halve the number of lanes.
+            "#,
+            &formats.unary,
+        )
+        .operands_in(vec![x])
+        .operands_out(vec![a]),
+    );
+
+    ig.push(
+        Inst::new(
+            "uwiden_low",
+            r#"
+        Widen the low lanes of `x` using unsigned extension.
+        
+        This will double the lane width and halve the number of lanes.
+            "#,
+            &formats.unary,
+        )
+        .operands_in(vec![x])
+        .operands_out(vec![a]),
+    );
+
+    ig.push(
+        Inst::new(
+            "uwiden_high",
+            r#"
+        Widen the high lanes of `x` using unsigned extension.
+        
+        This will double the lane width and halve the number of lanes.
+            "#,
+            &formats.unary,
+        )
+        .operands_in(vec![x])
+        .operands_out(vec![a]),
     );
 
     let IntTo = &TypeVar::new(

@@ -34,6 +34,12 @@ impl FaerieBuilder {
     /// enum to symbols. LibCalls are inserted in the IR as part of the legalization for certain
     /// floating point instructions, and for stack probes. If you don't know what to use for this
     /// argument, use `cranelift_module::default_libcall_names()`.
+    #[deprecated(
+        since = "0.65.0",
+        note = "the Cranelift developer team intends to stop maintaining the `cranelift-faerie`
+        crate and remove it from the `wasmtime` git repository on or after August 3, 2020. We
+        recommend users use its successor, the `cranelift-object` crate."
+    )]
     pub fn new(
         isa: Box<dyn TargetIsa>,
         name: String,
@@ -205,7 +211,16 @@ impl Backend for FaerieBackend {
             ref data_decls,
             ref function_relocs,
             ref data_relocs,
+            ref custom_segment_section,
         } = data_ctx.description();
+
+        if let Some((segment, section)) = custom_segment_section {
+            return Err(cranelift_module::ModuleError::Backend(anyhow::anyhow!(
+                "Custom section not supported by cranelift-faerie: `{}:{}`",
+                segment,
+                section
+            )));
+        }
 
         for &(offset, id) in function_relocs {
             let to = &namespace.get_function_decl(&function_decls[id]).name;

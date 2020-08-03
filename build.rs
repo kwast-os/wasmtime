@@ -154,10 +154,11 @@ fn write_testsuite_tests(
     if ignore(testsuite, &testname, strategy) {
         writeln!(out, "#[ignore]")?;
     }
-    writeln!(out, "fn r#{}() -> anyhow::Result<()> {{", &testname)?;
+    writeln!(out, "fn r#{}() {{", &testname)?;
+    writeln!(out, "    let _ = env_logger::try_init();")?;
     writeln!(
         out,
-        "crate::run_wast(r#\"{}\"#, crate::Strategy::{})",
+        "    crate::wast::run_wast(r#\"{}\"#, crate::wast::Strategy::{}).unwrap();",
         path.display(),
         strategy
     )?;
@@ -168,6 +169,7 @@ fn write_testsuite_tests(
 
 /// Ignore tests that aren't supported yet.
 fn ignore(testsuite: &str, testname: &str, strategy: &str) -> bool {
+    let target = env::var("TARGET").unwrap();
     match strategy {
         #[cfg(feature = "lightbeam")]
         "Lightbeam" => match (testsuite, testname) {
@@ -175,24 +177,36 @@ fn ignore(testsuite: &str, testname: &str, strategy: &str) -> bool {
             ("multi_value", _) => return true,
             ("reference_types", _) => return true,
             ("bulk_memory_operations", _) => return true,
-            // Lightbeam doesn't support float arguments on the stack.
-            ("spec_testsuite", "call") => return true,
             _ => (),
         },
         "Cranelift" => match (testsuite, testname) {
-            ("simd", "simd_bit_shift") => return true, // FIXME Unsupported feature: proposed SIMD operator I8x16Shl
-            ("simd", "simd_conversions") => return true, // FIXME Unsupported feature: proposed SIMD operator I16x8NarrowI32x4S
-            ("simd", "simd_f32x4") => return true, // FIXME expected V128(F32x4([CanonicalNan, CanonicalNan, Value(Float32 { bits: 0 }), Value(Float32 { bits: 0 })])), got V128(18428729675200069632)
-            ("simd", "simd_f64x2") => return true, // FIXME expected V128(F64x2([Value(Float64 { bits: 9221120237041090560 }), Value(Float64 { bits: 0 })])), got V128(0)
-            ("simd", "simd_f64x2_arith") => return true, // FIXME expected V128(F64x2([Value(Float64 { bits: 9221120237041090560 }), Value(Float64 { bits: 13835058055282163712 })])), got V128(255211775190703847615975447847722024960)
-            ("simd", "simd_i64x2_arith") => return true, // FIXME Unsupported feature: proposed SIMD operator I64x2Mul
-            ("simd", "simd_lane") => return true, // FIXME invalid u8 number: constant out of range: (v8x16.shuffle -1 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14...
-            ("simd", "simd_load") => return true, // FIXME Unsupported feature: proposed SIMD operator I8x16Shl
-            ("simd", "simd_splat") => return true, // FIXME Unsupported feature: proposed SIMD operator I8x16ShrS
+            ("simd", "simd_address") => return false,
+            ("simd", "simd_align") => return false,
+            ("simd", "simd_bitwise") => return false,
+            ("simd", "simd_bit_shift") => return false,
+            ("simd", "simd_boolean") => return false,
+            ("simd", "simd_f32x4_cmp") => return false,
+            ("simd", "simd_f64x2_cmp") => return false,
+            ("simd", "simd_i8x16_arith") => return false,
+            ("simd", "simd_i8x16_cmp") => return false,
+            ("simd", "simd_i8x16_sat_arith") => return false,
+            ("simd", "simd_i16x8_arith") => return false,
+            ("simd", "simd_i16x8_cmp") => return false,
+            ("simd", "simd_i16x8_sat_arith") => return false,
+            ("simd", "simd_i32x4_arith") => return false,
+            ("simd", "simd_i32x4_cmp") => return false,
+            ("simd", "simd_load_extend") => return false,
+            ("simd", "simd_load_splat") => return false,
+            ("simd", "simd_store") => return false,
+            // Most simd tests are known to fail on aarch64 for now, it's going
+            // to be a big chunk of work to implement them all there!
+            ("simd", _) if target.contains("aarch64") => return true,
 
-            // Still working on implementing these. See #929.
-            ("reference_types", "table_copy_on_imported_tables") => return false,
-            ("reference_types", _) => return true,
+            // TODO(#1886): Ignore reference types tests if this isn't x64,
+            // because Cranelift only supports reference types on x64.
+            ("reference_types", _) => {
+                return env::var("CARGO_CFG_TARGET_ARCH").unwrap() != "x86_64";
+            }
 
             _ => {}
         },

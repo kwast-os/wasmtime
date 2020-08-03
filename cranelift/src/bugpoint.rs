@@ -146,22 +146,6 @@ impl ReplaceInstWithConst {
             inst: first_inst,
         }
     }
-
-    fn const_for_type<'f, T: InstBuilder<'f>>(builder: T, ty: ir::Type) -> &'static str {
-        // Try to keep the result type consistent, and default to an integer type
-        // otherwise: this will cover all the cases for f32/f64 and integer types, or
-        // create verifier errors otherwise.
-        if ty == F32 {
-            builder.f32const(0.0);
-            "f32const"
-        } else if ty == F64 {
-            builder.f64const(0.0);
-            "f64const"
-        } else {
-            builder.iconst(ty, 0);
-            "iconst"
-        }
-    }
 }
 
 impl Mutator for ReplaceInstWithConst {
@@ -189,7 +173,7 @@ impl Mutator for ReplaceInstWithConst {
 
                 if num_results == 1 {
                     let ty = func.dfg.value_type(func.dfg.first_result(prev_inst));
-                    let new_inst_name = Self::const_for_type(func.dfg.replace(prev_inst), ty);
+                    let new_inst_name = const_for_type(func.dfg.replace(prev_inst), ty);
                     return (
                         func,
                         format!("Replace inst {} with {}.", prev_inst, new_inst_name),
@@ -212,7 +196,7 @@ impl Mutator for ReplaceInstWithConst {
                 for r in results {
                     let ty = pos.func.dfg.value_type(r);
                     let builder = pos.ins().with_results([Some(r)]);
-                    let new_inst_name = Self::const_for_type(builder, ty);
+                    let new_inst_name = const_for_type(builder, ty);
                     inst_names.push(new_inst_name);
                 }
 
@@ -274,6 +258,58 @@ impl Mutator for ReplaceInstWithTrap {
     }
 }
 
+/// Try to move instructions to entry block.
+struct MoveInstToEntryBlock {
+    block: Block,
+    inst: Inst,
+}
+
+impl MoveInstToEntryBlock {
+    fn new(func: &Function) -> Self {
+        let first_block = func.layout.entry_block().unwrap();
+        let first_inst = func.layout.first_inst(first_block).unwrap();
+        Self {
+            block: first_block,
+            inst: first_inst,
+        }
+    }
+}
+
+impl Mutator for MoveInstToEntryBlock {
+    fn name(&self) -> &'static str {
+        "move inst to entry block"
+    }
+
+    fn mutation_count(&self, func: &Function) -> usize {
+        inst_count(func)
+    }
+
+    fn mutate(&mut self, mut func: Function) -> Option<(Function, String, ProgressStatus)> {
+        next_inst_ret_prev(&func, &mut self.block, &mut self.inst).map(|(prev_block, prev_inst)| {
+            // Don't move instructions that are already in entry block
+            // and instructions that end blocks.
+            let first_block = func.layout.entry_block().unwrap();
+            if first_block == prev_block || self.block != prev_block {
+                return (
+                    func,
+                    format!("did nothing for {}", prev_inst),
+                    ProgressStatus::Skip,
+                );
+            }
+
+            let last_inst_of_first_block = func.layout.last_inst(first_block).unwrap();
+            func.layout.remove_inst(prev_inst);
+            func.layout.insert_inst(prev_inst, last_inst_of_first_block);
+
+            (
+                func,
+                format!("Move inst {} to entry block", prev_inst),
+                ProgressStatus::ExpandedOrShrinked,
+            )
+        })
+    }
+}
+
 /// Try to remove a block.
 struct RemoveBlock {
     block: Block,
@@ -309,6 +345,80 @@ impl Mutator for RemoveBlock {
                 ProgressStatus::ExpandedOrShrinked,
             )
         })
+    }
+}
+
+/// Try to replace the block params with constants.
+struct ReplaceBlockParamWithConst {
+    block: Block,
+    params_remaining: usize,
+}
+
+impl ReplaceBlockParamWithConst {
+    fn new(func: &Function) -> Self {
+        let first_block = func.layout.entry_block().unwrap();
+        Self {
+            block: first_block,
+            params_remaining: func.dfg.num_block_params(first_block),
+        }
+    }
+}
+
+impl Mutator for ReplaceBlockParamWithConst {
+    fn name(&self) -> &'static str {
+        "replace block parameter with const"
+    }
+
+    fn mutation_count(&self, func: &Function) -> usize {
+        func.layout
+            .blocks()
+            .map(|block| func.dfg.num_block_params(block))
+            .sum()
+    }
+
+    fn mutate(&mut self, mut func: Function) -> Option<(Function, String, ProgressStatus)> {
+        while self.params_remaining == 0 {
+            self.block = func.layout.next_block(self.block)?;
+            self.params_remaining = func.dfg.num_block_params(self.block);
+        }
+
+        self.params_remaining -= 1;
+        let param_index = self.params_remaining;
+
+        let param = func.dfg.block_params(self.block)[param_index];
+        let param_type = func.dfg.value_type(param);
+        func.dfg.remove_block_param(param);
+
+        let first_inst = func.layout.first_inst(self.block).unwrap();
+        let mut pos = FuncCursor::new(&mut func).at_inst(first_inst);
+        let builder = pos.ins().with_results([Some(param)]);
+        let new_inst_name = const_for_type(builder, param_type);
+
+        let mut cfg = ControlFlowGraph::new();
+        cfg.compute(&func);
+
+        // Remove parameters in branching instructions that point to this block
+        for pred in cfg.pred_iter(self.block) {
+            let inst = &mut func.dfg[pred.inst];
+            let num_fixed_args = inst.opcode().constraints().num_fixed_value_arguments();
+            let mut values = inst.take_value_list().unwrap();
+            values.remove(num_fixed_args + param_index, &mut func.dfg.value_lists);
+            func.dfg[pred.inst].put_value_list(values);
+        }
+
+        if Some(self.block) == func.layout.entry_block() {
+            // Entry block params must match function params
+            func.signature.params.remove(param_index);
+        }
+
+        Some((
+            func,
+            format!(
+                "Replaced param {} of {} by {}",
+                param, self.block, new_inst_name
+            ),
+            ProgressStatus::ExpandedOrShrinked,
+        ))
     }
 }
 
@@ -652,6 +762,31 @@ impl Mutator for MergeBlocks {
     }
 }
 
+fn const_for_type<'f, T: InstBuilder<'f>>(mut builder: T, ty: ir::Type) -> &'static str {
+    if ty == F32 {
+        builder.f32const(0.0);
+        "f32const"
+    } else if ty == F64 {
+        builder.f64const(0.0);
+        "f64const"
+    } else if ty.is_bool() {
+        builder.bconst(ty, false);
+        "bconst"
+    } else if ty.is_ref() {
+        builder.null(ty);
+        "null"
+    } else if ty.is_vector() {
+        let zero_data = vec![0; ty.bytes() as usize].into();
+        let zero_handle = builder.data_flow_graph_mut().constants.insert(zero_data);
+        builder.vconst(ty, zero_handle);
+        "vconst"
+    } else {
+        // Default to an integer type and possibly create verifier error
+        builder.iconst(ty, 0);
+        "iconst"
+    }
+}
+
 fn next_inst_ret_prev(
     func: &Function,
     block: &mut Block,
@@ -689,6 +824,15 @@ fn resolve_aliases(func: &mut Function) {
     }
 }
 
+/// Resolve aliases only if function still crashes after this.
+fn try_resolve_aliases(context: &mut CrashCheckContext, func: &mut Function) {
+    let mut func_with_resolved_aliases = func.clone();
+    resolve_aliases(&mut func_with_resolved_aliases);
+    if let CheckResult::Crash(_) = context.check_for_crash(&func_with_resolved_aliases) {
+        *func = func_with_resolved_aliases;
+    }
+}
+
 fn reduce(
     isa: &dyn TargetIsa,
     mut func: Function,
@@ -705,7 +849,7 @@ fn reduce(
         CheckResult::Crash(_) => {}
     }
 
-    resolve_aliases(&mut func);
+    try_resolve_aliases(&mut context, &mut func);
 
     let progress_bar = ProgressBar::with_draw_target(0, ProgressDrawTarget::stdout());
     progress_bar.set_style(
@@ -721,9 +865,11 @@ fn reduce(
                 0 => Box::new(RemoveInst::new(&func)),
                 1 => Box::new(ReplaceInstWithConst::new(&func)),
                 2 => Box::new(ReplaceInstWithTrap::new(&func)),
-                3 => Box::new(RemoveBlock::new(&func)),
-                4 => Box::new(RemoveUnusedEntities::new()),
-                5 => Box::new(MergeBlocks::new(&func)),
+                3 => Box::new(MoveInstToEntryBlock::new(&func)),
+                4 => Box::new(RemoveBlock::new(&func)),
+                5 => Box::new(ReplaceBlockParamWithConst::new(&func)),
+                6 => Box::new(RemoveUnusedEntities::new()),
+                7 => Box::new(MergeBlocks::new(&func)),
                 _ => break,
             };
 
@@ -801,6 +947,7 @@ fn reduce(
         }
     }
 
+    try_resolve_aliases(&mut context, &mut func);
     progress_bar.finish();
 
     let crash_msg = match context.check_for_crash(&func) {
@@ -923,12 +1070,8 @@ mod tests {
     use super::*;
     use cranelift_reader::ParseOptions;
 
-    #[test]
-    fn test_reduce() {
-        const TEST: &str = include_str!("../tests/bugpoint_test.clif");
-        const EXPECTED: &str = include_str!("../tests/bugpoint_test_expected.clif");
-
-        let test_file = parse_test(TEST, ParseOptions::default()).unwrap();
+    fn run_test(test_str: &str, expected_str: &str) {
+        let test_file = parse_test(test_str, ParseOptions::default()).unwrap();
 
         // If we have an isa from the command-line, use that. Otherwise if the
         // file contains a unique isa, use that.
@@ -954,7 +1097,24 @@ mod tests {
                 "reduction wasn't maximal for insts"
             );
 
-            assert_eq!(format!("{}", reduced_func), EXPECTED.replace("\r\n", "\n"));
+            assert_eq!(
+                format!("{}", reduced_func),
+                expected_str.replace("\r\n", "\n")
+            );
         }
+    }
+
+    #[test]
+    fn test_reduce() {
+        const TEST: &str = include_str!("../tests/bugpoint_test.clif");
+        const EXPECTED: &str = include_str!("../tests/bugpoint_test_expected.clif");
+        run_test(TEST, EXPECTED);
+    }
+
+    #[test]
+    fn test_consts() {
+        const TEST: &str = include_str!("../tests/bugpoint_consts.clif");
+        const EXPECTED: &str = include_str!("../tests/bugpoint_consts_expected.clif");
+        run_test(TEST, EXPECTED);
     }
 }

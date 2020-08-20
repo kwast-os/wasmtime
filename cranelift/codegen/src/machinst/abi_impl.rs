@@ -805,7 +805,7 @@ impl<M: ABIMachineImpl> ABIBody for ABIBodyImpl<M> {
         );
         let map_size = (virtual_sp_offset + nominal_sp_to_fp) as u32;
         let map_words = (map_size + 7) / 8; // FIXME: 64-bit machine assumed.
-        let mut bits = std::iter::repeat(false)
+        let mut bits = core::iter::repeat(false)
             .take(map_words as usize)
             .collect::<Vec<bool>>();
 

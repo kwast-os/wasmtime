@@ -501,7 +501,7 @@ impl ABIBody for X64ABIBody {
         );
         let map_size = (state.virtual_sp_offset + state.nominal_sp_to_fp) as u32;
         let map_words = (map_size + 7) / 8;
-        let mut bits = std::iter::repeat(false)
+        let mut bits = core::iter::repeat(false)
             .take(map_words as usize)
             .collect::<Vec<bool>>();
 

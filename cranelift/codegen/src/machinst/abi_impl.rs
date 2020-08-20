@@ -119,8 +119,8 @@ use crate::{ir, isa};
 use alloc::vec::Vec;
 use log::{debug, trace};
 use regalloc::{RealReg, Reg, RegClass, Set, SpillSlot, Writable};
-use std::marker::PhantomData;
-use std::mem;
+use core::marker::PhantomData;
+use core::mem;
 
 /// A location for an argument or return value.
 #[derive(Clone, Copy, Debug)]

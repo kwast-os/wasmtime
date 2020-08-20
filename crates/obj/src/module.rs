@@ -7,7 +7,7 @@ use object::write::{Object, Relocation, StandardSection, Symbol, SymbolSection};
 use object::{RelocationEncoding, RelocationKind, SymbolFlags, SymbolKind, SymbolScope};
 use wasmtime_debug::DwarfSection;
 use wasmtime_environ::isa::TargetFrontendConfig;
-use wasmtime_environ::{Compilation, DataInitializer, Module, Relocations};
+use wasmtime_environ::{CompiledFunctions, DataInitializer, Module};
 
 fn emit_vmcontext_init(
     obj: &mut Object,
@@ -52,13 +52,11 @@ pub fn emit_module(
     target: ObjectBuilderTarget,
     module: &Module,
     target_config: &TargetFrontendConfig,
-    compilation: Compilation,
-    relocations: Relocations,
+    compilation: CompiledFunctions,
     dwarf_sections: Vec<DwarfSection>,
     data_initializers: &[DataInitializer],
 ) -> Result<Object> {
-    let mut builder = ObjectBuilder::new(target, module);
-    builder.set_compilation(compilation, relocations);
+    let mut builder = ObjectBuilder::new(target, module, &compilation);
     builder.set_dwarf_sections(dwarf_sections);
     let mut obj = builder.build()?;
 
@@ -68,7 +66,7 @@ pub fn emit_module(
         declare_data_segment(&mut obj, initializer, i)?;
     }
 
-    for i in 0..module.local.table_plans.len() {
+    for i in 0..module.table_plans.len() {
         declare_table(&mut obj, i)?;
     }
 
@@ -76,7 +74,7 @@ pub fn emit_module(
         emit_data_segment(&mut obj, initializer, i)?;
     }
 
-    for i in 0..module.local.table_plans.len() {
+    for i in 0..module.table_plans.len() {
         emit_table(&mut obj, i)?;
     }
 

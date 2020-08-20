@@ -8,7 +8,7 @@ use wasmtime_runtime::VMFunctionImport;
 
 pub fn create_global(store: &Store, gt: &GlobalType, val: Val) -> Result<StoreInstanceHandle> {
     let mut module = Module::new();
-    let mut func_imports = PrimaryMap::new();
+    let mut func_imports = Vec::new();
     let mut externref_init = None;
 
     let global = wasm::Global {
@@ -37,11 +37,10 @@ pub fn create_global(store: &Store, gt: &GlobalType, val: Val) -> Result<StoreIn
                 // our global with a `ref.func` to grab that imported function.
                 let shared_sig_index = f.sig_index();
                 let local_sig_index = module
-                    .local
                     .signatures
                     .push(store.lookup_wasm_and_native_signatures(shared_sig_index));
-                let func_index = module.local.functions.push(local_sig_index);
-                module.local.num_imported_funcs = 1;
+                let func_index = module.functions.push(local_sig_index);
+                module.num_imported_funcs = 1;
                 module
                     .imports
                     .push(("".into(), "".into(), EntityIndex::Function(func_index)));
@@ -59,7 +58,7 @@ pub fn create_global(store: &Store, gt: &GlobalType, val: Val) -> Result<StoreIn
         },
     };
 
-    let global_id = module.local.globals.push(global);
+    let global_id = module.globals.push(global);
     module
         .exports
         .insert("global".to_string(), EntityIndex::Global(global_id));
@@ -69,7 +68,7 @@ pub fn create_global(store: &Store, gt: &GlobalType, val: Val) -> Result<StoreIn
         PrimaryMap::new(),
         Default::default(),
         Box::new(()),
-        func_imports,
+        &func_imports,
     )?;
 
     if let Some(x) = externref_init {

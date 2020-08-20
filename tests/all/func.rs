@@ -409,7 +409,7 @@ fn caller_memory() -> anyhow::Result<()> {
 
     let f = Func::wrap(&store, |c: Caller<'_>| {
         assert!(c.get_export("m").is_some());
-        assert!(c.get_export("f").is_none());
+        assert!(c.get_export("f").is_some());
         assert!(c.get_export("g").is_none());
         assert!(c.get_export("t").is_none());
     });
@@ -505,5 +505,20 @@ fn pass_cross_store_arg() -> anyhow::Result<()> {
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("cross-`Store`"));
 
+    Ok(())
+}
+
+#[test]
+fn externref_signature_no_reference_types() -> anyhow::Result<()> {
+    let store = Store::default();
+    Func::wrap(&store, |_: Option<Func>| {});
+    Func::new(
+        &store,
+        FuncType::new(
+            Box::new([ValType::FuncRef, ValType::ExternRef]),
+            Box::new([ValType::FuncRef, ValType::ExternRef]),
+        ),
+        |_, _, _| Ok(()),
+    );
     Ok(())
 }

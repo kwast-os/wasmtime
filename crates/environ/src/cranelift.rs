@@ -85,24 +85,21 @@
 // also need to actually catch stack overflow, so for now 32k is chosen and it's
 // assume no valid stack pointer will ever be `usize::max_value() - 32k`.
 
-use crate::address_map::{FunctionAddressMap, InstructionAddressMap};
-use crate::cache::{ModuleCacheDataTupleType, ModuleCacheEntry};
-use crate::compilation::{
-    Compilation, CompileError, CompiledFunction, Relocation, RelocationTarget, StackMapInformation,
+use crate::func_environ::{get_func_name, FuncEnvironment};
+use crate::Compiler;
+use crate::{
+    CompileError, CompiledFunction, Relocation, RelocationTarget, StackMapInformation,
     TrapInformation,
 };
-use crate::func_environ::{get_func_name, FuncEnvironment};
-use crate::{CacheConfig, FunctionBodyData, ModuleLocal, ModuleTranslation, Tunables};
+use crate::{FunctionAddressMap, InstructionAddressMap};
+use crate::{FunctionBodyData, ModuleTranslation};
 use cranelift_codegen::ir::{self, ExternalName};
 use cranelift_codegen::machinst::buffer::MachSrcLoc;
 use cranelift_codegen::print_errors::pretty_error;
 use cranelift_codegen::{binemit, isa, Context};
-use cranelift_entity::PrimaryMap;
-use cranelift_wasm::{DefinedFuncIndex, FuncIndex, FuncTranslator, ModuleTranslationState};
-#[cfg(feature = "parallel-compilation")]
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use cranelift_wasm::{DefinedFuncIndex, FuncIndex, FuncTranslator};
 use std::convert::TryFrom;
-use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
 
 /// Implementation of a relocation sink that just saves all the information for later
 pub struct RelocSink {
@@ -211,8 +208,8 @@ struct StackMapSink {
     infos: Vec<StackMapInformation>,
 }
 
-impl binemit::StackmapSink for StackMapSink {
-    fn add_stackmap(&mut self, code_offset: binemit::CodeOffset, stack_map: binemit::Stackmap) {
+impl binemit::StackMapSink for StackMapSink {
+    fn add_stack_map(&mut self, code_offset: binemit::CodeOffset, stack_map: binemit::StackMap) {
         self.infos.push(StackMapInformation {
             code_offset,
             stack_map,
@@ -281,57 +278,41 @@ fn get_function_address_map<'data>(
 
 /// A compiler that compiles a WebAssembly module with Cranelift, translating the Wasm to Cranelift IR,
 /// optimizing it and then translating to assembly.
-pub struct Cranelift;
+#[derive(Default)]
+pub struct Cranelift {
+    translators: Mutex<Vec<FuncTranslator>>,
+}
 
-impl crate::compilation::Compiler for Cranelift {
-    /// Compile the module using Cranelift, producing a compilation result with
-    /// associated relocations.
-    fn compile_module(
-        translation: &ModuleTranslation,
-        isa: &dyn isa::TargetIsa,
-        cache_config: &CacheConfig,
-    ) -> Result<ModuleCacheDataTupleType, CompileError> {
-        let cache_entry = ModuleCacheEntry::new("cranelift", cache_config);
+impl Cranelift {
+    fn take_translator(&self) -> FuncTranslator {
+        let candidate = self.translators.lock().unwrap().pop();
+        candidate.unwrap_or_else(FuncTranslator::new)
+    }
 
-        let data = cache_entry.get_data(
-            CompileEnv {
-                local: &translation.module.local,
-                module_translation: HashedModuleTranslationState(
-                    translation.module_translation.as_ref().unwrap(),
-                ),
-                function_body_inputs: &translation.function_body_inputs,
-                isa: Isa(isa),
-                tunables: &translation.tunables,
-            },
-            compile,
-        )?;
-        Ok(data.into_tuple())
+    fn save_translator(&self, translator: FuncTranslator) {
+        self.translators.lock().unwrap().push(translator);
     }
 }
 
-fn compile(env: CompileEnv<'_>) -> Result<ModuleCacheDataTupleType, CompileError> {
-    let Isa(isa) = env.isa;
-    let mut functions = PrimaryMap::with_capacity(env.function_body_inputs.len());
-    let mut relocations = PrimaryMap::with_capacity(env.function_body_inputs.len());
-    let mut address_transforms = PrimaryMap::with_capacity(env.function_body_inputs.len());
-    let mut value_ranges = PrimaryMap::with_capacity(env.function_body_inputs.len());
-    let mut stack_slots = PrimaryMap::with_capacity(env.function_body_inputs.len());
-    let mut traps = PrimaryMap::with_capacity(env.function_body_inputs.len());
-    let mut stack_maps = PrimaryMap::with_capacity(env.function_body_inputs.len());
-
-    type FunctionBodyInput<'a> = (DefinedFuncIndex, &'a FunctionBodyData<'a>);
-
-    let compile_function = |func_translator: &mut FuncTranslator,
-                            (i, input): &FunctionBodyInput| {
-        let func_index = env.local.func_index(*i);
+impl Compiler for Cranelift {
+    fn compile_function(
+        &self,
+        translation: &ModuleTranslation<'_>,
+        func_index: DefinedFuncIndex,
+        input: &FunctionBodyData<'_>,
+        isa: &dyn isa::TargetIsa,
+    ) -> Result<CompiledFunction, CompileError> {
+        let module = &translation.module;
+        let tunables = &translation.tunables;
+        let func_index = module.func_index(func_index);
         let mut context = Context::new();
         context.func.name = get_func_name(func_index);
-        context.func.signature = env.local.native_func_signature(func_index).clone();
-        if env.tunables.debug_info {
+        context.func.signature = module.native_func_signature(func_index).clone();
+        if tunables.debug_info {
             context.func.collect_debug_info();
         }
 
-        let mut func_env = FuncEnvironment::new(isa.frontend_config(), env.local, env.tunables);
+        let mut func_env = FuncEnvironment::new(isa.frontend_config(), module, tunables);
 
         // We use these as constant offsets below in
         // `stack_limit_from_arguments`, so assert their values here. This
@@ -366,13 +347,16 @@ fn compile(env: CompileEnv<'_>) -> Result<ModuleCacheDataTupleType, CompileError
             readonly: false,
         });
         context.func.stack_limit = Some(stack_limit);
-        func_translator.translate(
-            env.module_translation.0,
+        let mut func_translator = self.take_translator();
+        let result = func_translator.translate(
+            translation.module_translation.as_ref().unwrap(),
             input.data,
             input.module_offset,
             &mut context.func,
             &mut func_env,
-        )?;
+        );
+        self.save_translator(func_translator);
+        result?;
 
         let mut code_buf: Vec<u8> = Vec::new();
         let mut reloc_sink = RelocSink::new(func_index);
@@ -396,7 +380,7 @@ fn compile(env: CompileEnv<'_>) -> Result<ModuleCacheDataTupleType, CompileError
 
         let address_transform = get_function_address_map(&context, input, code_buf.len(), isa);
 
-        let ranges = if env.tunables.debug_info {
+        let ranges = if tunables.debug_info {
             let ranges = context.build_value_labels_ranges(isa).map_err(|error| {
                 CompileError::Codegen(pretty_error(&context.func, Some(isa), error))
             })?;
@@ -405,119 +389,16 @@ fn compile(env: CompileEnv<'_>) -> Result<ModuleCacheDataTupleType, CompileError
             None
         };
 
-        Ok((
-            code_buf,
-            context.func.jt_offsets,
-            reloc_sink.func_relocs,
-            address_transform,
-            ranges,
-            context.func.stack_slots,
-            trap_sink.traps,
+        Ok(CompiledFunction {
+            body: code_buf,
+            jt_offsets: context.func.jt_offsets,
+            relocations: reloc_sink.func_relocs,
+            address_map: address_transform,
+            value_labels_ranges: ranges.unwrap_or(Default::default()),
+            stack_slots: context.func.stack_slots,
+            traps: trap_sink.traps,
             unwind_info,
-            stack_map_sink.finish(),
-        ))
-    };
-
-    let inputs: Vec<FunctionBodyInput> = env.function_body_inputs.into_iter().collect();
-
-    let results: Result<Vec<_>, CompileError> = {
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "parallel-compilation")] {
-                inputs
-                    .par_iter()
-                    .map_init(FuncTranslator::new, compile_function)
-                    .collect()
-            } else {
-                let mut func_translator = FuncTranslator::new();
-                inputs
-                    .iter()
-                    .map(|input| compile_function(&mut func_translator, input))
-                    .collect()
-            }
-        }
-    };
-
-    results?.into_iter().for_each(
-        |(
-            function,
-            func_jt_offsets,
-            relocs,
-            address_transform,
-            ranges,
-            sss,
-            function_traps,
-            unwind_info,
-            stack_map,
-        )| {
-            functions.push(CompiledFunction {
-                body: function,
-                jt_offsets: func_jt_offsets,
-                unwind_info,
-            });
-            relocations.push(relocs);
-            address_transforms.push(address_transform);
-            value_ranges.push(ranges.unwrap_or_default());
-            stack_slots.push(sss);
-            traps.push(function_traps);
-            stack_maps.push(stack_map);
-        },
-    );
-
-    // TODO: Reorganize where we create the Vec for the resolved imports.
-
-    Ok((
-        Compilation::new(functions),
-        relocations,
-        address_transforms,
-        value_ranges,
-        stack_slots,
-        traps,
-        stack_maps,
-    ))
-}
-
-#[derive(Hash)]
-struct CompileEnv<'a> {
-    local: &'a ModuleLocal,
-    module_translation: HashedModuleTranslationState<'a>,
-    function_body_inputs: &'a PrimaryMap<DefinedFuncIndex, FunctionBodyData<'a>>,
-    isa: Isa<'a, 'a>,
-    tunables: &'a Tunables,
-}
-
-/// This is a wrapper struct to hash the specific bits of `TargetIsa` that
-/// affect the output we care about. The trait itself can't implement `Hash`
-/// (it's not object safe) so we have to implement our own hashing.
-struct Isa<'a, 'b>(&'a (dyn isa::TargetIsa + 'b));
-
-impl Hash for Isa<'_, '_> {
-    fn hash<H: Hasher>(&self, hasher: &mut H) {
-        self.0.triple().hash(hasher);
-        self.0.frontend_config().hash(hasher);
-
-        // TODO: if this `to_string()` is too expensive then we should upstream
-        // a native hashing ability of flags into cranelift itself, but
-        // compilation and/or cache loading is relatively expensive so seems
-        // unlikely.
-        self.0.flags().to_string().hash(hasher);
-
-        // TODO: ... and should we hash anything else? There's a lot of stuff in
-        // `TargetIsa`, like registers/encodings/etc. Should we be hashing that
-        // too? It seems like wasmtime doesn't configure it too too much, but
-        // this may become an issue at some point.
-    }
-}
-
-/// A wrapper struct around cranelift's `ModuleTranslationState` to implement
-/// `Hash` since it's not `Hash` upstream yet.
-///
-/// TODO: we should upstream a `Hash` implementation, it would be very small! At
-/// this moment though based on the definition it should be fine to not hash it
-/// since we'll re-hash the signatures later.
-struct HashedModuleTranslationState<'a>(&'a ModuleTranslationState);
-
-impl Hash for HashedModuleTranslationState<'_> {
-    fn hash<H: Hasher>(&self, _hasher: &mut H) {
-        // nothing to hash right now
+            stack_maps: stack_map_sink.finish(),
+        })
     }
 }

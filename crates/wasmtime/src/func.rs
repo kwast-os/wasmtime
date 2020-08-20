@@ -635,10 +635,6 @@ impl Func {
         Ok(results.into())
     }
 
-    pub(crate) fn wasmtime_function(&self) -> &wasmtime_runtime::ExportFunction {
-        &self.export
-    }
-
     pub(crate) fn caller_checked_anyfunc(
         &self,
     ) -> NonNull<wasmtime_runtime::VMCallerCheckedAnyfunc> {
@@ -788,6 +784,20 @@ impl Func {
     /// Get a reference to this function's store.
     pub fn store(&self) -> &Store {
         &self.instance.store
+    }
+
+    pub(crate) fn matches_expected(&self, expected: VMSharedSignatureIndex) -> bool {
+        self.sig_index() == expected
+    }
+
+    pub(crate) fn vmimport(&self) -> wasmtime_runtime::VMFunctionImport {
+        unsafe {
+            let f = self.caller_checked_anyfunc();
+            wasmtime_runtime::VMFunctionImport {
+                body: f.as_ref().func_ptr,
+                vmctx: f.as_ref().vmctx,
+            }
+        }
     }
 }
 
@@ -1421,17 +1431,21 @@ pub trait IntoFunc<Params, Results> {
 /// via [`Func::wrap`].
 ///
 /// This structure can be taken as the first parameter of a closure passed to
-/// [`Func::wrap`], and it can be used to learn information about the caller of
+/// [Func::wrap], and it can be used to learn information about the caller of
 /// the function, such as the calling module's memory, exports, etc.
 ///
 /// The primary purpose of this structure is to provide access to the
-/// caller's information, such as it's exported memory. This allows
-/// functions which take pointers as arguments to easily read the memory the
-/// pointers point into.
+/// caller's information, namely it's exported memory and exported functions. This
+/// allows functions which take pointers as arguments to easily read the memory the
+/// pointers point into, or if a function is expected to call malloc in the wasm
+/// module to reserve space for the output you can do that.
 ///
-/// Note that this is intended to be a pretty temporary mechanism for accessing
-/// the caller's memory until interface types has been fully standardized and
-/// implemented.
+/// Note that this Caller type a pretty temporary mechanism for accessing the
+/// caller's information until interface types has been fully standardized and
+/// implemented. The interface types proposal will obsolete this type and this will
+/// be removed in the future at some point after interface types is implemented. If
+/// you're relying on this Caller type it's recommended to become familiar with
+/// interface types to ensure that your use case is covered by the proposal.
 pub struct Caller<'a> {
     // Note that this is a `Weak` pointer instead of a `&'a Store`,
     // intentionally so. This allows us to break an `Rc` cycle which would
@@ -1457,14 +1471,18 @@ impl Caller<'_> {
     /// Looks up an export from the caller's module by the `name` given.
     ///
     /// Note that this function is only implemented for the `Extern::Memory`
-    /// type currently. No other exported structure can be acquired through this
-    /// just yet, but this may be implemented in the future!
+    /// and the `Extern::Func` types currently. No other exported structures
+    /// can be acquired through this just yet, but this may be implemented
+    /// in the future!
+    ///
+    /// Note that when accessing and calling exported functions, one should adhere
+    /// to the guidlines of the interface types proposal.
     ///
     /// # Return
     ///
-    /// If a memory export with the `name` provided was found, then it is
+    /// If a memory or function export with the `name` provided was found, then it is
     /// returned as a `Memory`. There are a number of situations, however, where
-    /// the memory may not be available:
+    /// the memory or function may not be available:
     ///
     /// * The caller instance may not have an export named `name`
     /// * The export named `name` may not be an exported memory
@@ -1479,10 +1497,7 @@ impl Caller<'_> {
                 return None;
             }
             let instance = InstanceHandle::from_vmctx(self.caller_vmctx);
-            let export = match instance.lookup(name) {
-                Some(Export::Memory(m)) => m,
-                _ => return None,
-            };
+            let export = instance.lookup(name)?;
             // Our `Weak` pointer is used only to break a cycle where `Store`
             // stores instance handles which have this weak pointer as their
             // custom host data. This function should only be invoke-able while
@@ -1490,8 +1505,11 @@ impl Caller<'_> {
             debug_assert!(self.store.upgrade().is_some());
             let handle =
                 Store::from_inner(self.store.upgrade()?).existing_instance_handle(instance);
-            let mem = Memory::from_wasmtime_memory(export, handle);
-            Some(Extern::Memory(mem))
+            match export {
+                Export::Memory(m) => Some(Extern::Memory(Memory::from_wasmtime_memory(m, handle))),
+                Export::Function(f) => Some(Extern::Func(Func::from_wasmtime_function(f, handle))),
+                _ => None,
+            }
         }
     }
 

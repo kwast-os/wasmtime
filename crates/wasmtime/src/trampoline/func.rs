@@ -174,14 +174,14 @@ fn make_trampoline(
     let mut code_buf: Vec<u8> = Vec::new();
     let mut reloc_sink = trampoline::TrampolineRelocSink::default();
     let mut trap_sink = binemit::NullTrapSink {};
-    let mut stackmap_sink = binemit::NullStackmapSink {};
+    let mut stack_map_sink = binemit::NullStackMapSink {};
     context
         .compile_and_emit(
             isa,
             &mut code_buf,
             &mut reloc_sink,
             &mut trap_sink,
-            &mut stackmap_sink,
+            &mut stack_map_sink,
         )
         .map_err(|error| pretty_error(&context.func, Some(isa), error))
         .expect("compile_and_emit");
@@ -197,6 +197,12 @@ fn make_trampoline(
             body: code_buf,
             jt_offsets: context.func.jt_offsets,
             unwind_info,
+            relocations: Default::default(),
+            address_map: Default::default(),
+            stack_maps: Default::default(),
+            stack_slots: Default::default(),
+            traps: Default::default(),
+            value_labels_ranges: Default::default(),
         })
         .expect("allocate_for_function")
 }
@@ -206,7 +212,10 @@ pub fn create_handle_with_function(
     func: Box<dyn Fn(*mut VMContext, *mut u128) -> Result<(), Trap>>,
     store: &Store,
 ) -> Result<(StoreInstanceHandle, VMTrampoline)> {
-    let isa = store.engine().config().target_isa();
+    // Note that we specifically enable reference types here in our ISA because
+    // `Func::new` is intended to be infallible, but our signature may use
+    // reference types which requires safepoints.
+    let isa = store.engine().config().target_isa_with_reference_types();
 
     let pointer_type = isa.pointer_type();
     let sig = ft.get_wasmtime_signature(pointer_type);
@@ -220,10 +229,9 @@ pub fn create_handle_with_function(
     // First up we manufacture a trampoline which has the ABI specified by `ft`
     // and calls into `stub_fn`...
     let sig_id = module
-        .local
         .signatures
         .push((ft.to_wasm_func_type(), sig.clone()));
-    let func_id = module.local.functions.push(sig_id);
+    let func_id = module.functions.push(sig_id);
     module
         .exports
         .insert("trampoline".to_string(), EntityIndex::Function(func_id));
@@ -254,7 +262,7 @@ pub fn create_handle_with_function(
         finished_functions,
         trampolines,
         Box::new(trampoline_state),
-        PrimaryMap::new(),
+        &[],
     )
     .map(|instance| (instance, trampoline))
 }
@@ -280,10 +288,9 @@ pub unsafe fn create_handle_with_raw_function(
     let mut trampolines = HashMap::new();
 
     let sig_id = module
-        .local
         .signatures
         .push((ft.to_wasm_func_type(), sig.clone()));
-    let func_id = module.local.functions.push(sig_id);
+    let func_id = module.functions.push(sig_id);
     module
         .exports
         .insert("trampoline".to_string(), EntityIndex::Function(func_id));
@@ -291,12 +298,5 @@ pub unsafe fn create_handle_with_raw_function(
     let sig_id = store.register_signature(ft.to_wasm_func_type(), sig);
     trampolines.insert(sig_id, trampoline);
 
-    create_handle(
-        module,
-        store,
-        finished_functions,
-        trampolines,
-        state,
-        PrimaryMap::new(),
-    )
+    create_handle(module, store, finished_functions, trampolines, state, &[])
 }

@@ -8,8 +8,9 @@ use crate::inst_predicates::{has_side_effect_or_load, is_constant_64bit};
 use crate::ir::instructions::BranchInfo;
 use crate::ir::types::I64;
 use crate::ir::{
-    ArgumentExtension, Block, Constant, ConstantData, ExternalName, Function, GlobalValueData,
-    Inst, InstructionData, MemFlags, Opcode, Signature, SourceLoc, Type, Value, ValueDef,
+    ArgumentPurpose, Block, Constant, ConstantData, ExternalName, Function, GlobalValueData,
+    Immediate, Inst, InstructionData, MemFlags, Opcode, Signature, SourceLoc, Type, Value,
+    ValueDef,
 };
 use crate::machinst::{
     ABIBody, BlockIndex, BlockLoweringOrder, LoweredBlock, MachLabel, VCode, VCodeBuilder,
@@ -67,6 +68,8 @@ pub trait LowerCtx {
     /// not allow the backend to specify its own result register for the return?
     /// Because there may be multiple return points.)
     fn retval(&self, idx: usize) -> Writable<Reg>;
+    /// Returns the vreg containing the VmContext parameter, if there's one.
+    fn get_vm_context(&self) -> Option<Reg>;
 
     // General instruction queries:
 
@@ -158,6 +161,11 @@ pub trait LowerCtx {
     fn is_reg_needed(&self, ir_inst: Inst, reg: Reg) -> bool;
     /// Retrieve constant data given a handle.
     fn get_constant_data(&self, constant_handle: Constant) -> &ConstantData;
+    /// Retrieve an immediate given a reference.
+    fn get_immediate(&self, imm: Immediate) -> &ConstantData;
+    /// Cause the value in `reg` to be in a virtual reg, by copying it into a new virtual reg
+    /// if `reg` is a real reg.  `ty` describes the type of the value in `reg`.
+    fn ensure_in_vreg(&mut self, reg: Reg, ty: Type) -> Reg;
 }
 
 /// A representation of all of the ways in which an instruction input is
@@ -229,7 +237,7 @@ pub struct Lower<'func, I: VCodeInst> {
     value_regs: SecondaryMap<Value, Reg>,
 
     /// Return-value vregs.
-    retval_regs: Vec<(Reg, ArgumentExtension)>,
+    retval_regs: Vec<Reg>,
 
     /// Instruction colors.
     inst_colors: SecondaryMap<Inst, InstColor>,
@@ -261,6 +269,10 @@ pub struct Lower<'func, I: VCodeInst> {
 
     /// The register to use for GetPinnedReg, if any, on this architecture.
     pinned_reg: Option<Reg>,
+
+    /// The vreg containing the special VmContext parameter, if it is present in the current
+    /// function's signature.
+    vm_context: Option<Reg>,
 }
 
 /// Notion of "relocation distance". This gives an estimate of how far away a symbol will be from a
@@ -331,6 +343,15 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             }
         }
 
+        let vm_context = f
+            .signature
+            .special_param_index(ArgumentPurpose::VMContext)
+            .map(|vm_context_index| {
+                let entry_block = f.layout.entry_block().unwrap();
+                let param = f.dfg.block_params(entry_block)[vm_context_index];
+                value_regs[param]
+            });
+
         // Assign a vreg to each return value.
         let mut retval_regs = vec![];
         for ret in &f.signature.returns {
@@ -338,7 +359,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             next_vreg += 1;
             let regclass = I::rc_for_type(ret.value_type)?;
             let vreg = Reg::new_virtual(regclass, v);
-            retval_regs.push((vreg, ret.extension));
+            retval_regs.push(vreg);
             vcode.set_vreg_type(vreg.as_virtual_reg().unwrap(), ret.value_type);
         }
 
@@ -387,6 +408,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             bb_insts: vec![],
             ir_insts: vec![],
             pinned_reg: None,
+            vm_context,
         })
     }
 
@@ -410,9 +432,9 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
     fn gen_retval_setup(&mut self, gen_ret_inst: GenerateReturn) {
         let retval_regs = self.retval_regs.clone();
-        for (i, (reg, ext)) in retval_regs.into_iter().enumerate() {
+        for (i, reg) in retval_regs.into_iter().enumerate() {
             let reg = Writable::from_reg(reg);
-            let insns = self.vcode.abi().gen_copy_reg_to_retval(i, reg, ext);
+            let insns = self.vcode.abi().gen_copy_reg_to_retval(i, reg);
             for insn in insns {
                 self.emit(insn);
             }
@@ -516,7 +538,11 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
         // Now, finally, deal with the moves whose sources are constants.
         for (ty, dst_reg, const_u64) in &const_bundles {
-            for inst in I::gen_constant(*dst_reg, *const_u64, *ty).into_iter() {
+            for inst in I::gen_constant(*dst_reg, *const_u64, *ty, |reg_class, ty| {
+                self.alloc_tmp(reg_class, ty)
+            })
+            .into_iter()
+            {
                 self.emit(inst);
             }
         }
@@ -752,10 +778,10 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         self.copy_bbs_to_vcode();
 
         // Now that we've emitted all instructions into the VCodeBuilder, let's build the VCode.
-        let (vcode, stackmap_info) = self.vcode.build();
+        let (vcode, stack_map_info) = self.vcode.build();
         debug!("built vcode: {:?}", vcode);
 
-        Ok((vcode, stackmap_info))
+        Ok((vcode, stack_map_info))
     }
 
     /// Get the actual inputs for a value. This is the implementation for
@@ -823,7 +849,11 @@ impl<'func, I: VCodeInst> LowerCtx for Lower<'func, I> {
     }
 
     fn retval(&self, idx: usize) -> Writable<Reg> {
-        Writable::from_reg(self.retval_regs[idx].0)
+        Writable::from_reg(self.retval_regs[idx])
+    }
+
+    fn get_vm_context(&self) -> Option<Reg> {
+        self.vm_context
     }
 
     fn data(&self, ir_inst: Inst) -> &InstructionData {
@@ -880,10 +910,14 @@ impl<'func, I: VCodeInst> LowerCtx for Lower<'func, I> {
 
     fn memflags(&self, ir_inst: Inst) -> Option<MemFlags> {
         match &self.f.dfg[ir_inst] {
+            &InstructionData::AtomicCas { flags, .. } => Some(flags),
+            &InstructionData::AtomicRmw { flags, .. } => Some(flags),
             &InstructionData::Load { flags, .. }
             | &InstructionData::LoadComplex { flags, .. }
+            | &InstructionData::LoadNoOffset { flags, .. }
             | &InstructionData::Store { flags, .. }
             | &InstructionData::StoreComplex { flags, .. } => Some(flags),
+            &InstructionData::StoreNoOffset { flags, .. } => Some(flags),
             _ => None,
         }
     }
@@ -964,6 +998,21 @@ impl<'func, I: VCodeInst> LowerCtx for Lower<'func, I> {
 
     fn get_constant_data(&self, constant_handle: Constant) -> &ConstantData {
         self.f.dfg.constants.get(constant_handle)
+    }
+
+    fn get_immediate(&self, imm: Immediate) -> &ConstantData {
+        self.f.dfg.immediates.get(imm).unwrap()
+    }
+
+    fn ensure_in_vreg(&mut self, reg: Reg, ty: Type) -> Reg {
+        if reg.is_virtual() {
+            reg
+        } else {
+            let rc = reg.get_class();
+            let new_reg = self.alloc_tmp(rc, ty);
+            self.emit(I::gen_move(new_reg, reg, ty));
+            new_reg.to_reg()
+        }
     }
 }
 

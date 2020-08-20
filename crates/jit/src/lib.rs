@@ -23,11 +23,9 @@
 
 mod code_memory;
 mod compiler;
-mod imports;
 mod instantiate;
 mod link;
 mod object;
-mod resolver;
 mod unwind;
 
 pub mod native;
@@ -35,9 +33,8 @@ pub mod trampoline;
 
 pub use crate::code_memory::CodeMemory;
 pub use crate::compiler::{Compilation, CompilationStrategy, Compiler};
-pub use crate::instantiate::{CompiledModule, SetupError};
+pub use crate::instantiate::{CompilationArtifacts, CompiledModule, SetupError};
 pub use crate::link::link_module;
-pub use crate::resolver::{NullResolver, Resolver};
 
 /// Version number of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -418,7 +418,7 @@ where
             let op = Operation::parse(&mut pc, encoding)?;
             match op {
                 Operation::FrameOffset { offset } => {
-                    // Expand DW_OP_fpreg into frame location and DW_OP_plus_uconst.
+                    // Expand DW_OP_fbreg into frame location and DW_OP_plus_uconst.
                     if frame_base.is_some() {
                         // Add frame base expressions.
                         flush_code_chunk!();
@@ -454,6 +454,7 @@ where
                 Operation::Deref { .. } => {
                     flush_code_chunk!();
                     parts.push(CompiledExpressionPart::Deref);
+                    continue;
                 }
                 _ => {
                     return Ok(None);
@@ -600,12 +601,25 @@ impl<'a, 'b> ValueLabelRangesBuilder<'a, 'b> {
 mod tests {
     use super::compile_expression;
     use super::{AddressTransform, FunctionFrameInfo, ValueLabel, ValueLabelsRanges};
-    use gimli::{self, Encoding, EndianSlice, Expression, RunTimeEndian};
+    use gimli::{self, constants, Encoding, EndianSlice, Expression, RunTimeEndian};
+    use wasmtime_environ::CompiledFunction;
+
+    macro_rules! dw_op {
+        (DW_OP_WASM_location) => {
+            0xed
+        };
+        ($i:literal) => {
+            $i
+        };
+        ($d:ident) => {
+            constants::$d.0 as u8
+        };
+    }
 
     macro_rules! expression {
-        ($($i:literal),*) => {
+        ($($t:tt),*) => {
             Expression(EndianSlice::new(
-                &[$($i),*],
+                &[$(dw_op!($t)),*],
                 RunTimeEndian::Little,
             ))
         }
@@ -624,8 +638,7 @@ mod tests {
 
         let (val1, val3, val20) = (ValueLabel::new(1), ValueLabel::new(3), ValueLabel::new(20));
 
-        // DW_OP_WASM_location 0x0 +20, DW_OP_stack_value
-        let e = expression!(0xed, 0x00, 0x14, 0x9f);
+        let e = expression!(DW_OP_WASM_location, 0x0, 20, DW_OP_stack_value);
         let ce = compile_expression(&e, DWARF_ENCODING, None)
             .expect("non-error")
             .expect("expression");
@@ -640,8 +653,14 @@ mod tests {
             }
         );
 
-        //  DW_OP_WASM_location 0x0 +1, DW_OP_plus_uconst 0x10, DW_OP_stack_value
-        let e = expression!(0xed, 0x00, 0x01, 0x23, 0x10, 0x9f);
+        let e = expression!(
+            DW_OP_WASM_location,
+            0x0,
+            1,
+            DW_OP_plus_uconst,
+            0x10,
+            DW_OP_stack_value
+        );
         let ce = compile_expression(&e, DWARF_ENCODING, None)
             .expect("non-error")
             .expect("expression");
@@ -659,11 +678,9 @@ mod tests {
             }
         );
 
-        // Frame base: DW_OP_WASM_location 0x0 +3, DW_OP_stack_value
-        let e = expression!(0xed, 0x00, 0x03, 0x9f);
+        let e = expression!(DW_OP_WASM_location, 0x0, 3, DW_OP_stack_value);
         let fe = compile_expression(&e, DWARF_ENCODING, None).expect("non-error");
-        // DW_OP_fpreg 0x12
-        let e = expression!(0x91, 0x12);
+        let e = expression!(DW_OP_fbreg, 0x12);
         let ce = compile_expression(&e, DWARF_ENCODING, fe.as_ref())
             .expect("non-error")
             .expect("expression");
@@ -680,36 +697,67 @@ mod tests {
                 need_deref: true
             }
         );
+
+        let e = expression!(
+            DW_OP_WASM_location,
+            0x0,
+            1,
+            DW_OP_plus_uconst,
+            5,
+            DW_OP_deref,
+            DW_OP_stack_value
+        );
+        let ce = compile_expression(&e, DWARF_ENCODING, None)
+            .expect("non-error")
+            .expect("expression");
+        assert_eq!(
+            ce,
+            CompiledExpression {
+                parts: vec![
+                    CompiledExpressionPart::Local {
+                        label: val1,
+                        trailing: false
+                    },
+                    CompiledExpressionPart::Code(vec![35, 5]),
+                    CompiledExpressionPart::Deref,
+                    CompiledExpressionPart::Code(vec![159])
+                ],
+                need_deref: false
+            }
+        );
     }
 
     fn create_mock_address_transform() -> AddressTransform {
-        use crate::read_debuginfo::WasmFileInfo;
         use wasmtime_environ::entity::PrimaryMap;
         use wasmtime_environ::ir::SourceLoc;
+        use wasmtime_environ::WasmFileInfo;
         use wasmtime_environ::{FunctionAddressMap, InstructionAddressMap};
         let mut module_map = PrimaryMap::new();
         let code_section_offset: u32 = 100;
-        module_map.push(FunctionAddressMap {
-            instructions: vec![
-                InstructionAddressMap {
-                    srcloc: SourceLoc::new(code_section_offset + 12),
-                    code_offset: 5,
-                    code_len: 3,
-                },
-                InstructionAddressMap {
-                    srcloc: SourceLoc::new(code_section_offset + 17),
-                    code_offset: 15,
-                    code_len: 8,
-                },
-            ],
-            start_srcloc: SourceLoc::new(code_section_offset + 10),
-            end_srcloc: SourceLoc::new(code_section_offset + 20),
-            body_offset: 0,
-            body_len: 30,
+        module_map.push(CompiledFunction {
+            address_map: FunctionAddressMap {
+                instructions: vec![
+                    InstructionAddressMap {
+                        srcloc: SourceLoc::new(code_section_offset + 12),
+                        code_offset: 5,
+                        code_len: 3,
+                    },
+                    InstructionAddressMap {
+                        srcloc: SourceLoc::new(code_section_offset + 17),
+                        code_offset: 15,
+                        code_len: 8,
+                    },
+                ],
+                start_srcloc: SourceLoc::new(code_section_offset + 10),
+                end_srcloc: SourceLoc::new(code_section_offset + 20),
+                body_offset: 0,
+                body_len: 30,
+            },
+            ..Default::default()
         });
         let fi = WasmFileInfo {
             code_section_offset: code_section_offset.into(),
-            funcs: Box::new([]),
+            funcs: Vec::new(),
             imported_func_count: 0,
             path: None,
         };

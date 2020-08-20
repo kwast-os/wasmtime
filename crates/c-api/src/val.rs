@@ -25,7 +25,7 @@ pub union wasm_val_union {
 impl Drop for wasm_val_t {
     fn drop(&mut self) {
         match into_valtype(self.kind) {
-            ValType::ExternRef => unsafe {
+            ValType::FuncRef | ValType::ExternRef => unsafe {
                 if !self.of.ref_.is_null() {
                     drop(Box::from_raw(self.of.ref_));
                 }
@@ -37,18 +37,19 @@ impl Drop for wasm_val_t {
 
 impl Clone for wasm_val_t {
     fn clone(&self) -> Self {
-        match into_valtype(self.kind) {
-            ValType::ExternRef => wasm_val_t {
-                kind: self.kind,
-                of: wasm_val_union {
-                    ref_: unsafe { Box::into_raw(Box::new((*self.of.ref_).clone())) },
-                },
-            },
-            _ => wasm_val_t {
-                kind: self.kind,
-                of: self.of,
-            },
+        let mut ret = wasm_val_t {
+            kind: self.kind,
+            of: self.of,
+        };
+        unsafe {
+            match into_valtype(self.kind) {
+                ValType::ExternRef | ValType::FuncRef if !self.of.ref_.is_null() => {
+                    ret.of.ref_ = Box::into_raw(Box::new((*self.of.ref_).clone()));
+                }
+                _ => {}
+            }
         }
+        return ret;
     }
 }
 
@@ -139,18 +140,7 @@ impl wasm_val_t {
 
 #[no_mangle]
 pub unsafe extern "C" fn wasm_val_copy(out: &mut MaybeUninit<wasm_val_t>, source: &wasm_val_t) {
-    crate::initialize(
-        out,
-        match into_valtype(source.kind) {
-            ValType::I32
-            | ValType::I64
-            | ValType::F32
-            | ValType::F64
-            | ValType::ExternRef
-            | ValType::FuncRef => source.clone(),
-            _ => unimplemented!("wasm_val_copy arg"),
-        },
-    );
+    crate::initialize(out, source.clone());
 }
 
 #[no_mangle]

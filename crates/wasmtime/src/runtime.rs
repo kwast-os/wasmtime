@@ -7,12 +7,16 @@ use std::cmp;
 use std::convert::TryFrom;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+#[cfg(feature = "cache")]
 use std::path::Path;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use target_lexicon::Triple;
 use wasmparser::Validator;
+#[cfg(feature = "cache")]
+use wasmtime_cache::CacheConfig;
 use wasmtime_environ::settings::{self, Configurable, SetError};
-use wasmtime_environ::{ir, isa, isa::TargetIsa, wasm, CacheConfig, Tunables};
+use wasmtime_environ::{ir, isa, isa::TargetIsa, wasm, Tunables};
 use wasmtime_jit::{native, CompilationStrategy, Compiler};
 use wasmtime_profiling::{JitDumpAgent, NullProfilerAgent, ProfilingAgent, VTuneAgent};
 use wasmtime_runtime::{
@@ -36,6 +40,7 @@ pub struct Config {
     pub(crate) isa_flags: isa::Builder,
     pub(crate) tunables: Tunables,
     pub(crate) strategy: CompilationStrategy,
+    #[cfg(feature = "cache")]
     pub(crate) cache_config: CacheConfig,
     pub(crate) profiler: Arc<dyn ProfilingAgent>,
     pub(crate) memory_creator: Option<MemoryCreatorProxy>,
@@ -88,13 +93,14 @@ impl Config {
             flags,
             isa_flags: native::builder(),
             strategy: CompilationStrategy::Auto,
+            #[cfg(feature = "cache")]
             cache_config: CacheConfig::new_cache_disabled(),
             profiler: Arc::new(NullProfilerAgent),
             memory_creator: None,
             max_wasm_stack: 1 << 20,
             wasm_threads: false,
-            wasm_reference_types: false,
-            wasm_bulk_memory: false,
+            wasm_reference_types: cfg!(target_arch = "x86_64"),
+            wasm_bulk_memory: true,
             wasm_simd: false,
             wasm_multi_value: true,
         }
@@ -169,25 +175,17 @@ impl Config {
         self
     }
 
-    /// Configures whether the WebAssembly reference types proposal will be
-    /// enabled for compilation.
+    /// Configures whether the [WebAssembly reference types proposal][proposal]
+    /// will be enabled for compilation.
     ///
-    /// The [WebAssembly reference types proposal][proposal] is not currently
-    /// fully standardized and is undergoing development. Additionally the
-    /// support in wasmtime itself is still being worked on. Support for this
-    /// feature can be enabled through this method for appropriate wasm
-    /// modules.
+    /// This feature gates items such as the `externref` and `funcref` types as
+    /// well as allowing a module to define multiple tables.
     ///
-    /// This feature gates items such as the `externref` type and multiple tables
-    /// being in a module. Note that enabling the reference types feature will
-    /// also enable the bulk memory feature.
+    /// Note that enabling the reference types feature will also enable the bulk
+    /// memory feature.
     ///
-    /// This is `false` by default.
-    ///
-    /// > **Note**: Wasmtime does not implement everything for the reference
-    /// > types proposal spec at this time, so bugs, panics, and possibly
-    /// > segfaults should be expected. This should not be enabled in a
-    /// > production setting right now.
+    /// This is `true` by default on x86-64, and `false` by default on other
+    /// architectures.
     ///
     /// [proposal]: https://github.com/webassembly/reference-types
     pub fn wasm_reference_types(&mut self, enable: bool) -> &mut Self {
@@ -234,19 +232,13 @@ impl Config {
         self
     }
 
-    /// Configures whether the WebAssembly bulk memory operations proposal will
-    /// be enabled for compilation.
-    ///
-    /// The [WebAssembly bulk memory operations proposal][proposal] is not
-    /// currently fully standardized and is undergoing development.
-    /// Additionally the support in wasmtime itself is still being worked on.
-    /// Support for this feature can be enabled through this method for
-    /// appropriate wasm modules.
+    /// Configures whether the [WebAssembly bulk memory operations
+    /// proposal][proposal] will be enabled for compilation.
     ///
     /// This feature gates items such as the `memory.copy` instruction, passive
     /// data/table segments, etc, being in a module.
     ///
-    /// This is `false` by default.
+    /// This is `true` by default.
     ///
     /// [proposal]: https://github.com/webassembly/bulk-memory-operations
     pub fn wasm_bulk_memory(&mut self, enable: bool) -> &mut Self {
@@ -394,14 +386,18 @@ impl Config {
     ///
     /// By default cache configuration is not enabled or loaded.
     ///
+    /// This method is only available when the `cache` feature of this crate is
+    /// enabled.
+    ///
     /// # Errors
     ///
     /// This method can fail due to any error that happens when loading the file
     /// pointed to by `path` and attempting to load the cache configuration.
     ///
     /// [docs]: https://bytecodealliance.github.io/wasmtime/cli-cache.html
+    #[cfg(feature = "cache")]
     pub fn cache_config_load(&mut self, path: impl AsRef<Path>) -> Result<&mut Self> {
-        self.cache_config = wasmtime_environ::CacheConfig::from_file(Some(path.as_ref()))?;
+        self.cache_config = CacheConfig::from_file(Some(path.as_ref()))?;
         Ok(self)
     }
 
@@ -415,6 +411,9 @@ impl Config {
     ///
     /// By default cache configuration is not enabled or loaded.
     ///
+    /// This method is only available when the `cache` feature of this crate is
+    /// enabled.
+    ///
     /// # Errors
     ///
     /// This method can fail due to any error that happens when loading the
@@ -423,8 +422,9 @@ impl Config {
     /// for an enabled cache are applied.
     ///
     /// [docs]: https://bytecodealliance.github.io/wasmtime/cli-cache.html
+    #[cfg(feature = "cache")]
     pub fn cache_config_load_default(&mut self) -> Result<&mut Self> {
-        self.cache_config = wasmtime_environ::CacheConfig::from_file(None)?;
+        self.cache_config = CacheConfig::from_file(None)?;
         Ok(self)
     }
 
@@ -609,6 +609,12 @@ impl Config {
             .finish(settings::Flags::new(self.flags.clone()))
     }
 
+    pub(crate) fn target_isa_with_reference_types(&self) -> Box<dyn TargetIsa> {
+        let mut flags = self.flags.clone();
+        flags.set("enable_safepoints", "true").unwrap();
+        self.isa_flags.clone().finish(settings::Flags::new(flags))
+    }
+
     pub(crate) fn validator(&self) -> Validator {
         let mut ret = Validator::new();
         ret.wasm_threads(self.wasm_threads)
@@ -621,12 +627,23 @@ impl Config {
 
     fn build_compiler(&self) -> Compiler {
         let isa = self.target_isa();
-        Compiler::new(
-            isa,
-            self.strategy,
-            self.cache_config.clone(),
-            self.tunables.clone(),
-        )
+        Compiler::new(isa, self.strategy, self.tunables.clone())
+    }
+
+    /// Hashes/fingerprints compiler setting to ensure that compatible
+    /// compilation artifacts are used.
+    pub(crate) fn compiler_fingerprint<H>(&self, state: &mut H)
+    where
+        H: Hasher,
+    {
+        self.flags.hash(state);
+        self.tunables.hash(state);
+
+        let triple = Triple::host();
+        triple.hash(state);
+
+        // Catch accidental bugs of reusing across wasmtime versions.
+        env!("CARGO_PKG_VERSION").hash(state);
     }
 }
 
@@ -773,6 +790,11 @@ impl Engine {
 
     pub(crate) fn compiler(&self) -> &Compiler {
         &self.inner.compiler
+    }
+
+    #[cfg(feature = "cache")]
+    pub(crate) fn cache_config(&self) -> &CacheConfig {
+        &self.config().cache_config
     }
 
     /// Returns whether the engine `a` and `b` refer to the same configuration.
@@ -960,20 +982,15 @@ impl Store {
 
     pub(crate) fn register_stack_maps(&self, module: &Module) {
         let module = &module.compiled_module();
-        self.stack_map_registry().register_stack_maps(
-            module
-                .finished_functions()
-                .values()
-                .zip(module.stack_maps().values())
-                .map(|(func, stack_maps)| unsafe {
-                    let ptr = (**func).as_ptr();
-                    let len = (**func).len();
-                    let start = ptr as usize;
-                    let end = ptr as usize + len;
-                    let range = start..end;
-                    (range, &stack_maps[..])
-                }),
-        );
+        self.stack_map_registry()
+            .register_stack_maps(module.stack_maps().map(|(func, stack_maps)| unsafe {
+                let ptr = (*func).as_ptr();
+                let len = (*func).len();
+                let start = ptr as usize;
+                let end = ptr as usize + len;
+                let range = start..end;
+                (range, stack_maps)
+            }));
     }
 
     pub(crate) unsafe fn add_instance(&self, handle: InstanceHandle) -> StoreInstanceHandle {

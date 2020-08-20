@@ -7,7 +7,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use wasmtime_environ::entity::PrimaryMap;
-use wasmtime_environ::wasm::{DefinedFuncIndex, FuncIndex};
+use wasmtime_environ::wasm::DefinedFuncIndex;
 use wasmtime_environ::Module;
 use wasmtime_runtime::{
     Imports, InstanceHandle, StackMapRegistry, VMExternRefActivationsTable, VMFunctionBody,
@@ -20,18 +20,13 @@ pub(crate) fn create_handle(
     finished_functions: PrimaryMap<DefinedFuncIndex, *mut [VMFunctionBody]>,
     trampolines: HashMap<VMSharedSignatureIndex, VMTrampoline>,
     state: Box<dyn Any>,
-    func_imports: PrimaryMap<FuncIndex, VMFunctionImport>,
+    func_imports: &[VMFunctionImport],
 ) -> Result<StoreInstanceHandle> {
-    let imports = Imports::new(
-        func_imports,
-        PrimaryMap::new(),
-        PrimaryMap::new(),
-        PrimaryMap::new(),
-    );
+    let mut imports = Imports::default();
+    imports.functions = func_imports;
 
     // Compute indices into the shared signature table.
     let signatures = module
-        .local
         .signatures
         .values()
         .map(|(wasm, native)| store.register_signature(wasm.clone(), native.clone()))

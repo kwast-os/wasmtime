@@ -2,19 +2,19 @@
 
 use crate::instantiate::SetupError;
 use crate::object::{build_object, ObjectUnwindInfo};
-use cranelift_codegen::ir;
 use object::write::Object;
-use wasmtime_debug::{emit_dwarf, DebugInfoData, DwarfSection};
-use wasmtime_environ::entity::{EntityRef, PrimaryMap};
-use wasmtime_environ::isa::{unwind::UnwindInfo, TargetFrontendConfig, TargetIsa};
-use wasmtime_environ::wasm::{DefinedFuncIndex, DefinedMemoryIndex, MemoryIndex};
+use std::hash::{Hash, Hasher};
+use wasmtime_debug::{emit_dwarf, DwarfSection};
+use wasmtime_environ::entity::EntityRef;
+use wasmtime_environ::isa::{TargetFrontendConfig, TargetIsa};
+use wasmtime_environ::wasm::{DefinedMemoryIndex, MemoryIndex};
 use wasmtime_environ::{
-    CacheConfig, Compiler as _C, Module, ModuleAddressMap, ModuleMemoryOffset, ModuleTranslation,
-    ModuleVmctxInfo, StackMaps, Traps, Tunables, VMOffsets, ValueLabelsRanges,
+    CompiledFunctions, Compiler as EnvCompiler, DebugInfoData, Module, ModuleMemoryOffset,
+    ModuleTranslation, Tunables, VMOffsets,
 };
 
 /// Select which kind of compilation to use.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Hash)]
 pub enum CompilationStrategy {
     /// Let Wasmtime pick the strategy.
     Auto,
@@ -37,23 +37,24 @@ pub enum CompilationStrategy {
 /// TODO: Consider using cranelift-module.
 pub struct Compiler {
     isa: Box<dyn TargetIsa>,
+    compiler: Box<dyn EnvCompiler>,
     strategy: CompilationStrategy,
-    cache_config: CacheConfig,
     tunables: Tunables,
 }
 
 impl Compiler {
     /// Construct a new `Compiler`.
-    pub fn new(
-        isa: Box<dyn TargetIsa>,
-        strategy: CompilationStrategy,
-        cache_config: CacheConfig,
-        tunables: Tunables,
-    ) -> Self {
+    pub fn new(isa: Box<dyn TargetIsa>, strategy: CompilationStrategy, tunables: Tunables) -> Self {
         Self {
             isa,
             strategy,
-            cache_config,
+            compiler: match strategy {
+                CompilationStrategy::Auto | CompilationStrategy::Cranelift => {
+                    Box::new(wasmtime_environ::cranelift::Cranelift::default())
+                }
+                #[cfg(feature = "lightbeam")]
+                CompilationStrategy::Lightbeam => Box::new(wasmtime_environ::lightbeam::Lightbeam),
+            },
             tunables,
         }
     }
@@ -67,47 +68,27 @@ fn _assert_compiler_send_sync() {
 fn transform_dwarf_data(
     isa: &dyn TargetIsa,
     module: &Module,
-    debug_data: DebugInfoData,
-    address_transform: &ModuleAddressMap,
-    value_ranges: &ValueLabelsRanges,
-    stack_slots: PrimaryMap<DefinedFuncIndex, ir::StackSlots>,
-    unwind_info: PrimaryMap<DefinedFuncIndex, &Option<UnwindInfo>>,
+    debug_data: &DebugInfoData,
+    funcs: &CompiledFunctions,
 ) -> Result<Vec<DwarfSection>, SetupError> {
     let target_config = isa.frontend_config();
-    let ofs = VMOffsets::new(target_config.pointer_bytes(), &module.local);
+    let ofs = VMOffsets::new(target_config.pointer_bytes(), &module);
 
-    let module_vmctx_info = {
-        ModuleVmctxInfo {
-            memory_offset: if ofs.num_imported_memories > 0 {
-                ModuleMemoryOffset::Imported(ofs.vmctx_vmmemory_import(MemoryIndex::new(0)))
-            } else if ofs.num_defined_memories > 0 {
-                ModuleMemoryOffset::Defined(
-                    ofs.vmctx_vmmemory_definition_base(DefinedMemoryIndex::new(0)),
-                )
-            } else {
-                ModuleMemoryOffset::None
-            },
-            stack_slots,
-        }
+    let memory_offset = if ofs.num_imported_memories > 0 {
+        ModuleMemoryOffset::Imported(ofs.vmctx_vmmemory_import(MemoryIndex::new(0)))
+    } else if ofs.num_defined_memories > 0 {
+        ModuleMemoryOffset::Defined(ofs.vmctx_vmmemory_definition_base(DefinedMemoryIndex::new(0)))
+    } else {
+        ModuleMemoryOffset::None
     };
-    emit_dwarf(
-        isa,
-        &debug_data,
-        &address_transform,
-        &module_vmctx_info,
-        &value_ranges,
-        &unwind_info,
-    )
-    .map_err(SetupError::DebugInfo)
+    emit_dwarf(isa, debug_data, funcs, &memory_offset).map_err(SetupError::DebugInfo)
 }
 
 #[allow(missing_docs)]
 pub struct Compilation {
     pub obj: Object,
     pub unwind_info: Vec<ObjectUnwindInfo>,
-    pub traps: Traps,
-    pub stack_maps: StackMaps,
-    pub address_transform: ModuleAddressMap,
+    pub funcs: CompiledFunctions,
 }
 
 impl Compiler {
@@ -127,69 +108,76 @@ impl Compiler {
     }
 
     /// Compile the given function bodies.
-    pub(crate) fn compile<'data>(
+    pub fn compile<'data>(
         &self,
         translation: &ModuleTranslation,
-        debug_data: Option<DebugInfoData>,
     ) -> Result<Compilation, SetupError> {
-        let (
-            compilation,
-            relocations,
-            address_transform,
-            value_ranges,
-            stack_slots,
-            traps,
-            stack_maps,
-        ) = match self.strategy {
-            // For now, interpret `Auto` as `Cranelift` since that's the most stable
-            // implementation.
-            CompilationStrategy::Auto | CompilationStrategy::Cranelift => {
-                wasmtime_environ::cranelift::Cranelift::compile_module(
-                    translation,
-                    &*self.isa,
-                    &self.cache_config,
-                )
-            }
-            #[cfg(feature = "lightbeam")]
-            CompilationStrategy::Lightbeam => {
-                wasmtime_environ::lightbeam::Lightbeam::compile_module(
-                    translation,
-                    &*self.isa,
-                    &self.cache_config,
-                )
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "parallel-compilation")] {
+                use rayon::prelude::*;
+                let iter = translation.function_body_inputs
+                    .iter()
+                    .collect::<Vec<_>>()
+                    .into_par_iter();
+            } else {
+                let iter = translation.function_body_inputs.iter();
             }
         }
-        .map_err(SetupError::Compile)?;
+        let funcs = iter
+            .map(|(index, func)| {
+                self.compiler
+                    .compile_function(translation, index, func, &*self.isa)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<CompiledFunctions>();
 
-        let dwarf_sections = if debug_data.is_some() && !compilation.is_empty() {
-            let unwind_info = compilation.unwind_info();
+        let dwarf_sections = if translation.debuginfo.is_some() && !funcs.is_empty() {
             transform_dwarf_data(
                 &*self.isa,
                 &translation.module,
-                debug_data.unwrap(),
-                &address_transform,
-                &value_ranges,
-                stack_slots,
-                unwind_info,
+                translation.debuginfo.as_ref().unwrap(),
+                &funcs,
             )?
         } else {
             vec![]
         };
 
-        let (obj, unwind_info) = build_object(
-            &*self.isa,
-            &translation.module,
-            compilation,
-            relocations,
-            dwarf_sections,
-        )?;
+        let (obj, unwind_info) =
+            build_object(&*self.isa, &translation.module, &funcs, dwarf_sections)?;
 
         Ok(Compilation {
             obj,
             unwind_info,
-            traps,
-            stack_maps,
-            address_transform,
+            funcs,
         })
+    }
+}
+
+impl Hash for Compiler {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        let Compiler {
+            strategy,
+            compiler: _,
+            isa,
+            tunables,
+        } = self;
+
+        // Hash compiler's flags: compilation strategy, isa, frontend config,
+        // misc tunables.
+        strategy.hash(hasher);
+        isa.triple().hash(hasher);
+        // TODO: if this `to_string()` is too expensive then we should upstream
+        // a native hashing ability of flags into cranelift itself, but
+        // compilation and/or cache loading is relatively expensive so seems
+        // unlikely.
+        isa.flags().to_string().hash(hasher);
+        isa.frontend_config().hash(hasher);
+        tunables.hash(hasher);
+
+        // TODO: ... and should we hash anything else? There's a lot of stuff in
+        // `TargetIsa`, like registers/encodings/etc. Should we be hashing that
+        // too? It seems like wasmtime doesn't configure it too too much, but
+        // this may become an issue at some point.
     }
 }

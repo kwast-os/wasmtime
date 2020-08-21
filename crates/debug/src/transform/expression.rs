@@ -64,6 +64,10 @@ impl ExpressionWriter {
         write::Writer::write_u8(&mut self.0, b)
     }
 
+    pub fn write_u32(&mut self, b: u32) -> write::Result<()> {
+        write::Writer::write_u32(&mut self.0, b)
+    }
+
     pub fn write_uleb128(&mut self, i: u64) -> write::Result<()> {
         write::Writer::write_uleb128(&mut self.0, i)
     }
@@ -196,8 +200,8 @@ fn append_memory_deref(
     }
     writer.write_op(gimli::constants::DW_OP_deref)?;
     writer.write_op(gimli::constants::DW_OP_swap)?;
-    writer.write_op(gimli::constants::DW_OP_constu)?;
-    writer.write_uleb128(0xffff_ffff)?;
+    writer.write_op(gimli::constants::DW_OP_const4u)?;
+    writer.write_u32(0xffff_ffff)?;
     writer.write_op(gimli::constants::DW_OP_and)?;
     writer.write_op(gimli::constants::DW_OP_plus)?;
     buf.extend(writer.into_vec());
@@ -454,7 +458,8 @@ where
                 Operation::Deref { .. } => {
                     flush_code_chunk!();
                     parts.push(CompiledExpressionPart::Deref);
-                    continue;
+                    // Don't re-enter the loop here (i.e. continue), because the
+                    // DW_OP_deref still needs to be kept.
                 }
                 _ => {
                     return Ok(None);
@@ -720,7 +725,7 @@ mod tests {
                     },
                     CompiledExpressionPart::Code(vec![35, 5]),
                     CompiledExpressionPart::Deref,
-                    CompiledExpressionPart::Code(vec![159])
+                    CompiledExpressionPart::Code(vec![6, 159])
                 ],
                 need_deref: false
             }

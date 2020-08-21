@@ -1,6 +1,6 @@
 use crate::binemit::Reloc;
 use crate::ir::immediates::{Ieee32, Ieee64};
-use crate::ir::{types, TrapCode};
+use crate::ir::TrapCode;
 use crate::isa::x64::inst::args::*;
 use crate::isa::x64::inst::*;
 use crate::machinst::{MachBuffer, MachInstEmit, MachLabel};
@@ -1596,8 +1596,12 @@ pub(crate) fn emit(
             let rex = RexFlags::clear_w();
 
             let (prefix, opcode) = match op {
+                SseOpcode::Cvtss2sd => (LegacyPrefix::_F3, 0x0F5A),
+                SseOpcode::Cvtsd2ss => (LegacyPrefix::_F2, 0x0F5A),
                 SseOpcode::Movaps => (LegacyPrefix::None, 0x0F28),
                 SseOpcode::Movapd => (LegacyPrefix::_66, 0x0F28),
+                SseOpcode::Movdqa => (LegacyPrefix::_66, 0x0F6F),
+                SseOpcode::Movdqu => (LegacyPrefix::_F3, 0x0F6F),
                 SseOpcode::Movsd => (LegacyPrefix::_F2, 0x0F10),
                 SseOpcode::Movss => (LegacyPrefix::_F3, 0x0F10),
                 SseOpcode::Movups => (LegacyPrefix::None, 0x0F10),
@@ -1606,8 +1610,6 @@ pub(crate) fn emit(
                 SseOpcode::Sqrtpd => (LegacyPrefix::_66, 0x0F51),
                 SseOpcode::Sqrtss => (LegacyPrefix::_F3, 0x0F51),
                 SseOpcode::Sqrtsd => (LegacyPrefix::_F2, 0x0F51),
-                SseOpcode::Cvtss2sd => (LegacyPrefix::_F3, 0x0F5A),
-                SseOpcode::Cvtsd2ss => (LegacyPrefix::_F2, 0x0F5A),
                 _ => unimplemented!("Opcode {:?} not implemented", op),
             };
 
@@ -1805,17 +1807,9 @@ pub(crate) fn emit(
             // "constant inline" code should be replaced by constant pool integration.
 
             // Load the inline constant.
-            let opcode = match *ty {
-                types::F32X4 => SseOpcode::Movups,
-                types::F64X2 => SseOpcode::Movupd,
-                types::I8X16 => SseOpcode::Movupd, // TODO replace with MOVDQU
-                _ => unimplemented!("cannot yet load constants for type: {}", ty),
-            };
             let constant_start_label = sink.get_label();
-            let load_offset = RegMem::mem(Amode::rip_relative(BranchTarget::Label(
-                constant_start_label,
-            )));
-            let load = Inst::xmm_unary_rm_r(opcode, load_offset, *dst);
+            let load_offset = Amode::rip_relative(BranchTarget::Label(constant_start_label));
+            let load = Inst::load(*ty, load_offset, *dst, ExtKind::None, None);
             load.emit(sink, flags, state);
 
             // Jump over the constant.
@@ -1839,10 +1833,14 @@ pub(crate) fn emit(
             srcloc,
         } => {
             let (prefix, opcode) = match op {
+                SseOpcode::Movaps => (LegacyPrefix::None, 0x0F29),
+                SseOpcode::Movapd => (LegacyPrefix::_66, 0x0F29),
+                SseOpcode::Movdqa => (LegacyPrefix::_66, 0x0F7F),
+                SseOpcode::Movdqu => (LegacyPrefix::_F3, 0x0F7F),
                 SseOpcode::Movss => (LegacyPrefix::_F3, 0x0F11),
                 SseOpcode::Movsd => (LegacyPrefix::_F2, 0x0F11),
-                SseOpcode::Movaps => (LegacyPrefix::None, 0x0F29),
                 SseOpcode::Movups => (LegacyPrefix::None, 0x0F11),
+                SseOpcode::Movupd => (LegacyPrefix::_66, 0x0F11),
                 _ => unimplemented!("Opcode {:?} not implemented", op),
             };
             let dst = &dst.finalize(state);

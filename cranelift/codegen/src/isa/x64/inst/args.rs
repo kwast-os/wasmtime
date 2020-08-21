@@ -380,6 +380,8 @@ pub enum SseOpcode {
     Movaps,
     Movapd,
     Movd,
+    Movdqa,
+    Movdqu,
     Movq,
     Movss,
     Movsd,
@@ -487,6 +489,8 @@ impl SseOpcode {
             | SseOpcode::Movq
             | SseOpcode::Movsd
             | SseOpcode::Movupd
+            | SseOpcode::Movdqa
+            | SseOpcode::Movdqu
             | SseOpcode::Mulpd
             | SseOpcode::Mulsd
             | SseOpcode::Orpd
@@ -571,6 +575,8 @@ impl fmt::Debug for SseOpcode {
             SseOpcode::Movaps => "movaps",
             SseOpcode::Movapd => "movapd",
             SseOpcode::Movd => "movd",
+            SseOpcode::Movdqa => "movdqa",
+            SseOpcode::Movdqu => "movdqu",
             SseOpcode::Movq => "movq",
             SseOpcode::Movss => "movss",
             SseOpcode::Movsd => "movsd",
@@ -626,6 +632,16 @@ impl fmt::Display for SseOpcode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(self, f)
     }
+}
+
+/// This defines the ways a value can be extended: either signed- or zero-extension, or none for
+/// types that are not extended. Contrast with [ExtMode], which defines the widths from and to which
+/// values can be extended.
+#[derive(Clone, PartialEq)]
+pub enum ExtKind {
+    None,
+    SignExtend,
+    ZeroExtend,
 }
 
 /// These indicate ways of extending (widening) a value, using the Intel

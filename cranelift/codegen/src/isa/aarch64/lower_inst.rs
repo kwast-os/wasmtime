@@ -211,13 +211,118 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                     ra: zero_reg(),
                 });
             } else {
-                ctx.emit(Inst::VecRRR {
-                    alu_op: VecALUOp::Mul,
-                    rd,
-                    rn,
-                    rm,
-                    size: VectorSize::from_ty(ty),
-                });
+                if ty == I64X2 {
+                    let tmp1 = ctx.alloc_tmp(RegClass::V128, I64X2);
+                    let tmp2 = ctx.alloc_tmp(RegClass::V128, I64X2);
+
+                    // This I64X2 multiplication is performed with several 32-bit
+                    // operations.
+
+                    // 64-bit numbers x and y, can be represented as:
+                    //   x = a + 2^32(b)
+                    //   y = c + 2^32(d)
+
+                    // A 64-bit multiplication is:
+                    //   x * y = ac + 2^32(ad + bc) + 2^64(bd)
+                    // note: `2^64(bd)` can be ignored, the value is too large to fit in
+                    // 64 bits.
+
+                    // This sequence implements a I64X2 multiply, where the registers
+                    // `rn` and `rm` are split up into 32-bit components:
+                    //   rn = |d|c|b|a|
+                    //   rm = |h|g|f|e|
+                    //
+                    //   rn * rm = |cg + 2^32(ch + dg)|ae + 2^32(af + be)|
+                    //
+                    //  The sequence is:
+                    //  rev64 rd.4s, rm.4s
+                    //  mul rd.4s, rd.4s, rn.4s
+                    //  xtn tmp1.2s, rn.2d
+                    //  addp rd.4s, rd.4s, rd.4s
+                    //  xtn tmp2.2s, rm.2d
+                    //  shll rd.2d, rd.2s, #32
+                    //  umlal rd.2d, tmp2.2s, tmp1.2s
+
+                    // Reverse the 32-bit elements in the 64-bit words.
+                    //   rd = |g|h|e|f|
+                    ctx.emit(Inst::VecMisc {
+                        op: VecMisc2::Rev64,
+                        rd,
+                        rn: rm,
+                        size: VectorSize::Size32x4,
+                    });
+
+                    // Calculate the high half components.
+                    //   rd = |dg|ch|be|af|
+                    //
+                    // Note that this 32-bit multiply of the high half
+                    // discards the bits that would overflow, same as
+                    // if 64-bit operations were used. Also the Shll
+                    // below would shift out the overflow bits anyway.
+                    ctx.emit(Inst::VecRRR {
+                        alu_op: VecALUOp::Mul,
+                        rd,
+                        rn: rd.to_reg(),
+                        rm: rn,
+                        size: VectorSize::Size32x4,
+                    });
+
+                    // Extract the low half components of rn.
+                    //   tmp1 = |c|a|
+                    ctx.emit(Inst::VecMiscNarrow {
+                        op: VecMiscNarrowOp::Xtn,
+                        rd: tmp1,
+                        rn,
+                        size: VectorSize::Size32x2,
+                    });
+
+                    // Sum the respective high half components.
+                    //   rd = |dg+ch|be+af||dg+ch|be+af|
+                    ctx.emit(Inst::VecRRR {
+                        alu_op: VecALUOp::Addp,
+                        rd: rd,
+                        rn: rd.to_reg(),
+                        rm: rd.to_reg(),
+                        size: VectorSize::Size32x4,
+                    });
+
+                    // Extract the low half components of rm.
+                    //   tmp2 = |g|e|
+                    ctx.emit(Inst::VecMiscNarrow {
+                        op: VecMiscNarrowOp::Xtn,
+                        rd: tmp2,
+                        rn: rm,
+                        size: VectorSize::Size32x2,
+                    });
+
+                    // Shift the high half components, into the high half.
+                    //   rd = |dg+ch << 32|be+af << 32|
+                    ctx.emit(Inst::VecMisc {
+                        op: VecMisc2::Shll,
+                        rd,
+                        rn: rd.to_reg(),
+                        size: VectorSize::Size32x2,
+                    });
+
+                    // Multiply the low components together, and accumulate with the high
+                    // half.
+                    //   rd = |rd[1] + cg|rd[0] + ae|
+                    ctx.emit(Inst::VecRRR {
+                        alu_op: VecALUOp::Umlal,
+                        rd,
+                        rn: tmp2.to_reg(),
+                        rm: tmp1.to_reg(),
+                        size: VectorSize::Size32x2,
+                    });
+                } else {
+                    ctx.emit(Inst::VecRRR {
+                        alu_op: VecALUOp::Mul,
+                        rd,
+                        rn,
+                        rm,
+                        size: VectorSize::from_ty(ty),
+                    });
+                }
             }
         }
 
@@ -2157,12 +2262,12 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             let out_bits = ty_bits(ctx.output_ty(insn, 0));
             let signed = op == Opcode::FcvtToSint;
             let op = match (signed, in_bits, out_bits) {
-                (false, 32, 32) => FpuToIntOp::F32ToU32,
-                (true, 32, 32) => FpuToIntOp::F32ToI32,
+                (false, 32, 8) | (false, 32, 16) | (false, 32, 32) => FpuToIntOp::F32ToU32,
+                (true, 32, 8) | (true, 32, 16) | (true, 32, 32) => FpuToIntOp::F32ToI32,
                 (false, 32, 64) => FpuToIntOp::F32ToU64,
                 (true, 32, 64) => FpuToIntOp::F32ToI64,
-                (false, 64, 32) => FpuToIntOp::F64ToU32,
-                (true, 64, 32) => FpuToIntOp::F64ToI32,
+                (false, 64, 8) | (false, 64, 16) | (false, 64, 32) => FpuToIntOp::F64ToU32,
+                (true, 64, 8) | (true, 64, 16) | (true, 64, 32) => FpuToIntOp::F64ToI32,
                 (false, 64, 64) => FpuToIntOp::F64ToU64,
                 (true, 64, 64) => FpuToIntOp::F64ToI64,
                 _ => panic!("Unknown input/output-bits combination"),
@@ -2199,6 +2304,16 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             if in_bits == 32 {
                 // From float32.
                 let (low_bound, low_cond, high_bound) = match (signed, out_bits) {
+                    (true, 8) => (
+                        i8::min_value() as f32 - 1.,
+                        FloatCC::GreaterThan,
+                        i8::max_value() as f32 + 1.,
+                    ),
+                    (true, 16) => (
+                        i16::min_value() as f32 - 1.,
+                        FloatCC::GreaterThan,
+                        i16::max_value() as f32 + 1.,
+                    ),
                     (true, 32) => (
                         i32::min_value() as f32, // I32_MIN - 1 isn't precisely representable as a f32.
                         FloatCC::GreaterThanOrEqual,
@@ -2209,6 +2324,8 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                         FloatCC::GreaterThanOrEqual,
                         i64::max_value() as f32 + 1.,
                     ),
+                    (false, 8) => (-1., FloatCC::GreaterThan, u8::max_value() as f32 + 1.),
+                    (false, 16) => (-1., FloatCC::GreaterThan, u16::max_value() as f32 + 1.),
                     (false, 32) => (-1., FloatCC::GreaterThan, u32::max_value() as f32 + 1.),
                     (false, 64) => (-1., FloatCC::GreaterThan, u64::max_value() as f32 + 1.),
                     _ => panic!("Unknown input/output-bits combination"),
@@ -2240,6 +2357,16 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             } else {
                 // From float64.
                 let (low_bound, low_cond, high_bound) = match (signed, out_bits) {
+                    (true, 8) => (
+                        i8::min_value() as f64 - 1.,
+                        FloatCC::GreaterThan,
+                        i8::max_value() as f64 + 1.,
+                    ),
+                    (true, 16) => (
+                        i16::min_value() as f64 - 1.,
+                        FloatCC::GreaterThan,
+                        i16::max_value() as f64 + 1.,
+                    ),
                     (true, 32) => (
                         i32::min_value() as f64 - 1.,
                         FloatCC::GreaterThan,
@@ -2250,6 +2377,8 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                         FloatCC::GreaterThanOrEqual,
                         i64::max_value() as f64 + 1.,
                     ),
+                    (false, 8) => (-1., FloatCC::GreaterThan, u8::max_value() as f64 + 1.),
+                    (false, 16) => (-1., FloatCC::GreaterThan, u16::max_value() as f64 + 1.),
                     (false, 32) => (-1., FloatCC::GreaterThan, u32::max_value() as f64 + 1.),
                     (false, 64) => (-1., FloatCC::GreaterThan, u64::max_value() as f64 + 1.),
                     _ => panic!("Unknown input/output-bits combination"),
@@ -2289,10 +2418,10 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             let out_bits = ty_bits(ctx.output_ty(insn, 0));
             let signed = op == Opcode::FcvtFromSint;
             let op = match (signed, in_bits, out_bits) {
-                (false, 32, 32) => IntToFpuOp::U32ToF32,
-                (true, 32, 32) => IntToFpuOp::I32ToF32,
-                (false, 32, 64) => IntToFpuOp::U32ToF64,
-                (true, 32, 64) => IntToFpuOp::I32ToF64,
+                (false, 8, 32) | (false, 16, 32) | (false, 32, 32) => IntToFpuOp::U32ToF32,
+                (true, 8, 32) | (true, 16, 32) | (true, 32, 32) => IntToFpuOp::I32ToF32,
+                (false, 8, 64) | (false, 16, 64) | (false, 32, 64) => IntToFpuOp::U32ToF64,
+                (true, 8, 64) | (true, 16, 64) | (true, 32, 64) => IntToFpuOp::I32ToF64,
                 (false, 64, 32) => IntToFpuOp::U64ToF32,
                 (true, 64, 32) => IntToFpuOp::I64ToF32,
                 (false, 64, 64) => IntToFpuOp::U64ToF64,
@@ -2300,8 +2429,8 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 _ => panic!("Unknown input/output-bits combination"),
             };
             let narrow_mode = match (signed, in_bits) {
-                (false, 32) => NarrowValueMode::ZeroExtend32,
-                (true, 32) => NarrowValueMode::SignExtend32,
+                (false, 8) | (false, 16) | (false, 32) => NarrowValueMode::ZeroExtend32,
+                (true, 8) | (true, 16) | (true, 32) => NarrowValueMode::SignExtend32,
                 (false, 64) => NarrowValueMode::ZeroExtend64,
                 (true, 64) => NarrowValueMode::SignExtend64,
                 _ => panic!("Unknown input size"),

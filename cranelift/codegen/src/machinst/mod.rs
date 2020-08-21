@@ -103,6 +103,7 @@ use crate::result::CodegenResult;
 use crate::settings::Flags;
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Debug;
 use regalloc::RegUsageCollector;
@@ -110,7 +111,6 @@ use regalloc::{
     RealReg, RealRegUniverse, Reg, RegClass, RegUsageMapper, SpillSlot, VirtualReg, Writable,
 };
 use smallvec::SmallVec;
-use alloc::string::String;
 use target_lexicon::Triple;
 
 pub mod lower;

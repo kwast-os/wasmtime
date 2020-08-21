@@ -9,9 +9,9 @@ use crate::{CodegenError, CodegenResult};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use args::*;
+use core::mem;
 use log::trace;
 use regalloc::{RealReg, Reg, RegClass, Set, SpillSlot, Writable};
-use core::mem;
 
 /// This is the limit for the size of argument and return-value areas on the
 /// stack. We place a reasonable limit here to avoid integer overflow issues

@@ -30,6 +30,8 @@ use crate::translation_utils::{
 };
 use crate::translation_utils::{FuncIndex, GlobalIndex, MemoryIndex, SignatureIndex, TableIndex};
 use crate::wasm_unsupported;
+use core::cmp;
+use core::convert::TryFrom;
 use core::convert::TryInto;
 use core::{i32, u32};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -40,8 +42,6 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::packed_option::ReservedValue;
 use cranelift_frontend::{FunctionBuilder, Variable};
-use core::cmp;
-use core::convert::TryFrom;
 use std::vec::Vec;
 use wasmparser::{MemoryImmediate, Operator};
 

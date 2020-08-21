@@ -2,9 +2,9 @@
 
 use regalloc::{RealRegUniverse, Reg, Writable};
 
+use alloc::string::{String, ToString};
 use core::fmt::Debug;
 use core::hash::Hash;
-use alloc::string::{String, ToString};
 
 // FIXME: Should this go into regalloc.rs instead?
 

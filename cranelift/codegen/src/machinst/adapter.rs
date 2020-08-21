@@ -10,8 +10,8 @@ use crate::settings::Flags;
 #[cfg(feature = "testing_hooks")]
 use crate::regalloc::RegDiversions;
 
-use core::any::Any;
 use alloc::borrow::Cow;
+use core::any::Any;
 use core::fmt;
 use target_lexicon::Triple;
 

@@ -16,11 +16,11 @@ use crate::result::CodegenResult;
 use crate::settings::Flags;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::convert::TryFrom;
 use cranelift_codegen_shared::condcodes::CondCode;
 use log::trace;
 use regalloc::{Reg, RegClass, Writable};
 use smallvec::SmallVec;
-use core::convert::TryFrom;
 use target_lexicon::Triple;
 
 /// Context passed to all lowering functions.

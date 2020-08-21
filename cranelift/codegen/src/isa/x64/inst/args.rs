@@ -4,10 +4,10 @@ use super::regs::{self, show_ireg_sized};
 use super::EmitState;
 use crate::ir::condcodes::{FloatCC, IntCC};
 use crate::machinst::*;
+use alloc::string::{String, ToString};
+use core::fmt;
 use core::fmt::Debug;
 use regalloc::{RealRegUniverse, Reg, RegClass, RegUsageCollector, RegUsageMapper};
-use core::fmt;
-use alloc::string::{String, ToString};
 
 /// A possible addressing mode (amode) that can be used in instructions.
 /// These denote a 64-bit value only.

@@ -9,14 +9,14 @@ use crate::ir::{types, ExternalName, Opcode, SourceLoc, TrapCode, Type};
 use crate::machinst::*;
 use crate::{settings, settings::Flags, CodegenError, CodegenResult};
 use alloc::boxed::Box;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::fmt;
 use regalloc::{
     RealRegUniverse, Reg, RegClass, RegUsageCollector, RegUsageMapper, SpillSlot, VirtualReg,
     Writable,
 };
 use smallvec::SmallVec;
-use core::fmt;
-use alloc::string::{String, ToString};
 
 pub mod args;
 mod emit;

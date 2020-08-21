@@ -4,10 +4,10 @@ use crate::ir::TrapCode;
 use crate::isa::x64::inst::args::*;
 use crate::isa::x64::inst::*;
 use crate::machinst::{MachBuffer, MachInstEmit, MachLabel};
+use core::convert::TryFrom;
 use core::convert::TryInto;
 use log::debug;
 use regalloc::{Reg, RegClass, Writable};
-use core::convert::TryFrom;
 
 fn low8_will_sign_extend_to_64(x: u32) -> bool {
     let xs = (x as i32) as i64;

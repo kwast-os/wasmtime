@@ -11,9 +11,9 @@
 //! for each function we compile.
 
 use crate::{machinst::pretty_print::ShowWithRRU, settings};
+use alloc::string::String;
 use alloc::vec::Vec;
 use regalloc::{RealReg, RealRegUniverse, Reg, RegClass, RegClassInfo, NUM_REG_CLASSES};
-use alloc::string::String;
 
 // Hardware encodings for a few registers.
 

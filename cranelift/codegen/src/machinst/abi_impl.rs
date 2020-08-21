@@ -117,10 +117,10 @@ use crate::settings;
 use crate::CodegenResult;
 use crate::{ir, isa};
 use alloc::vec::Vec;
-use log::{debug, trace};
-use regalloc::{RealReg, Reg, RegClass, Set, SpillSlot, Writable};
 use core::marker::PhantomData;
 use core::mem;
+use log::{debug, trace};
+use regalloc::{RealReg, Reg, RegClass, Set, SpillSlot, Writable};
 
 /// A location for an argument or return value.
 #[derive(Clone, Copy, Debug)]

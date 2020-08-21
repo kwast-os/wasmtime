@@ -145,9 +145,9 @@ use crate::ir::{ExternalName, Opcode, SourceLoc, TrapCode};
 use crate::machinst::{BlockIndex, MachInstLabelUse, VCodeInst};
 use crate::timing;
 
+use core::mem;
 use log::trace;
 use smallvec::SmallVec;
-use core::mem;
 
 /// A buffer of output to be produced, fixed up, and then emitted to a CodeSink
 /// in bulk.

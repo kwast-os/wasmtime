@@ -30,10 +30,10 @@ use regalloc::{
 };
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::{borrow::Cow, vec::Vec};
 use core::fmt;
 use core::iter;
-use alloc::string::String;
 
 /// Index referring to an instruction in VCode.
 pub type InsnIndex = u32;

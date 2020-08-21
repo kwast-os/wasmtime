@@ -27,7 +27,6 @@
         clippy::use_self
     )
 )]
-
 #![no_std]
 
 #[cfg(not(feature = "std"))]

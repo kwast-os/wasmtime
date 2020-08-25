@@ -849,7 +849,7 @@ impl CC {
             FloatCC::Ordered => CC::NP,
             FloatCC::Unordered => CC::P,
             // Alias for NE
-            FloatCC::NotEqual | FloatCC::OrderedNotEqual => CC::NZ,
+            FloatCC::OrderedNotEqual => CC::NZ,
             // Alias for E
             FloatCC::UnorderedOrEqual => CC::Z,
             // Alias for A
@@ -859,12 +859,14 @@ impl CC {
             FloatCC::UnorderedOrLessThan => CC::B,
             FloatCC::UnorderedOrLessThanOrEqual => CC::BE,
             FloatCC::Equal
+            | FloatCC::NotEqual
             | FloatCC::LessThan
             | FloatCC::LessThanOrEqual
             | FloatCC::UnorderedOrGreaterThan
-            | FloatCC::UnorderedOrGreaterThanOrEqual => {
-                panic!("No single condition code to guarantee ordered. Treat as special case.")
-            }
+            | FloatCC::UnorderedOrGreaterThanOrEqual => panic!(
+                "{:?} can't be lowered to a CC code; treat as special case.",
+                floatcc
+            ),
         }
     }
 
@@ -1009,4 +1011,15 @@ impl OperandSize {
             Self::Size64 => 64,
         }
     }
+}
+
+/// An x64 memory fence kind.
+#[derive(Clone)]
+pub enum FenceKind {
+    /// `mfence` instruction ("Memory Fence")
+    MFence,
+    /// `lfence` instruction ("Load Fence")
+    LFence,
+    /// `sfence` instruction ("Store Fence")
+    SFence,
 }
